@@ -14,8 +14,22 @@ tools/flash_and_watch.sh images/01-blinky.BTF
 
 That releases the serial port, refuses to upload if anything else holds it,
 uploads, then captures the boot trace to `logs/` while showing it live.
-Put the radio in bootloader mode first: **hold the bottom two side buttons
-while powering on.** Power-cycle when it prompts.
+
+**You should not need the side buttons.** Every image here carries the update
+listener, so a running radio hands itself to the bootloader when it sees the
+host handshake. Just leave the radio powered on and run the command.
+
+Two things to know about that:
+
+* The listener is armed at the very top of `main()` and runs from the UART4 RX
+  interrupt, so it works even when the firmware is otherwise broken — a hung
+  main loop or a wedged scheduler does not stop it.
+* It cannot survive a fault that disables interrupts. **The side buttons remain
+  the guaranteed path**: hold the bottom two while powering on, then run the
+  same command. The script detects which mode the radio is in and adapts.
+
+The handover itself is **not yet verified on hardware**. If it does not work it
+degrades to a normal boot rather than bricking anything.
 
 | # | image | proves | pass looks like |
 |---|---|---|---|
