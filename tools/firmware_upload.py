@@ -48,6 +48,11 @@ HANDSHAKE_STRING = b"PROGRAMBT9000U"
 UPDATE_STRING    = b"UPDATE"
 ACK_BYTE         = 0x06
 HEADER           = 0xAA
+
+# Data-block transport tuning. See send_data() for why these exist.
+DATA_BLOCK_RETRIES = 5      # attempts per block before giving up
+DATA_BLOCK_DELAY   = 0.012  # settle time after each accepted block
+DATA_RETRY_DELAY   = 0.150  # longer pause after a failure, to let flash finish
 FOOTER           = 0x55
 
 # Bootloader commands
@@ -452,13 +457,49 @@ class FirmwareUploader:
             if len(block) < DATA_BLOCK_SIZE:
                 block = block + b'\x00' * (DATA_BLOCK_SIZE - len(block))
 
-            resp = self.send_command(CMD_DATA, args=seq, data=block, timeout=10.0)
+            # Retry with resync.
+            #
+            # Without this, uploads failed at a DIFFERENT block each attempt
+            # ("Wrong data length" at 16, then 21). That error is the bootloader
+            # saying the frame it received did not match its length field, i.e.
+            # bytes went missing -- it is a transport fault, not bad data. The
+            # radio drops incoming bytes while it is busy erasing/writing a
+            # flash page, and with a 1029-byte packet already streaming there is
+            # nothing to stop the frame being chopped.
+            #
+            # Re-sending a block is safe: the sequence number is explicit in the
+            # packet (args=seq), so the bootloader writes the same destination
+            # regardless of how many times it is sent.
+            resp = None
+            for attempt in range(DATA_BLOCK_RETRIES):
+                if attempt:
+                    # Drop whatever partial frame desynced us, and give the
+                    # radio time to finish its flash write before trying again.
+                    self.ser.reset_input_buffer()
+                    self.ser.reset_output_buffer()
+                    time.sleep(DATA_RETRY_DELAY)
+
+                resp = self.send_command(CMD_DATA, args=seq, data=block,
+                                         timeout=10.0)
+                if resp is not None and resp["result"] == RESULT_ACK:
+                    break
+
+                why = "no response" if resp is None else resp["result_name"]
+                print(f"\n  block {seq}: {why}"
+                      f" (attempt {attempt + 1}/{DATA_BLOCK_RETRIES})")
+
             if resp is None:
-                print(f"\n  ERROR: No response to data block {seq}")
+                print(f"\n  ERROR: No response to data block {seq}"
+                      f" after {DATA_BLOCK_RETRIES} attempts")
                 return False
             if resp["result"] != RESULT_ACK:
-                print(f"\n  ERROR: Block {seq} rejected: {resp['result_name']}")
+                print(f"\n  ERROR: Block {seq} rejected: {resp['result_name']}"
+                      f" after {DATA_BLOCK_RETRIES} attempts")
                 return False
+
+            # Breathing room so the next packet does not arrive while the radio
+            # is still committing this one.
+            time.sleep(DATA_BLOCK_DELAY)
 
             # Progress bar
             pct = (seq + 1) * 100 // total_packages
