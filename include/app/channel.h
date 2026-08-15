@@ -36,8 +36,15 @@
 
 #include <stdint.h>
 
-#define CHANNEL_COUNT       990
-#define CHANNEL_RECORD_SIZE 32
+/* The on-flash format is defined by flash_layout.h; defer to it rather than
+ * restating it. Both headers previously defined CHANNEL_RECORD_SIZE with the
+ * same value but a different spelling (0x20 vs 32), and the channel count as
+ * CHANNEL_COUNT_MAX vs CHANNEL_COUNT. That was harmless only for as long as no
+ * translation unit included both -- the first one to do so failed to build on
+ * the redefinition. One definition of each now. */
+#include "drivers/flash_layout.h"
+
+#define CHANNEL_COUNT       CHANNEL_COUNT_MAX
 #define CHANNEL_NAME_LEN    12
 
 /* Channel record (parsed from 32-byte flash record) */
