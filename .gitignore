@@ -76,3 +76,8 @@ assembly/.r2*
 *.swo
 .vscode/
 .idea/
+
+# Diagnostic images and captured boot logs are build artifacts.
+images/
+logs/
+*.BTF
