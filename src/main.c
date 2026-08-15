@@ -23,9 +23,15 @@
 
 #ifdef HW_TEST
 #include "tests/hw_test.h"
+#include "app/update_listener.h"
 
 int main(void)
 {
+    /* Arm the soft update listener in the hardware tests too. Without it, every
+     * rung of the bring-up ladder would need the side-button + battery-pull
+     * dance to move to the next one, which is most of the cost of testing. */
+    update_listener_init();
+
 #if   HW_TEST == 1
     test_blinky();
 #elif HW_TEST == 2
@@ -83,6 +89,7 @@ int main(void)
 #include "app/channel_picker.h"
 #include "app/zone_filter.h"
 #include "app/zone_browser.h"
+#include "app/update_listener.h"
 #include "app/freq_entry.h"
 #include "app/dtmf.h"
 #include "app/splash.h"
@@ -519,6 +526,19 @@ int main(void)
                     GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
     IWDG_FEED();
+
+    /* Arm the soft update listener BEFORE anything else.
+     *
+     * Placed here on purpose: everything below can fail, and the whole point of
+     * this listener is to reflash a radio whose firmware is broken. It runs
+     * from the UART4 RX interrupt, so it survives a hung main loop or a wedged
+     * scheduler. Send the normal handshake with firmware_upload.py (no --ptt)
+     * and the radio hands itself to the bootloader -- no side buttons, no
+     * battery pull.
+     *
+     * The side-button entry remains the guaranteed path: this cannot survive a
+     * fault that kills interrupts. */
+    update_listener_init();
 
     /* Initialize event queue */
     event_init();

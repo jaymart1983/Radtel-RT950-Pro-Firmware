@@ -44,16 +44,26 @@ if command -v lsof >/dev/null && lsof "$PORT" >/dev/null 2>&1; then
     exit 1
 fi
 
+# Two ways into the bootloader. Try the soft one first: any firmware carrying
+# the update listener hands itself over when it sees the handshake, so no side
+# buttons and no battery pull. Fall back to assuming the radio is already in
+# bootloader mode, which is what the side-button entry gives you.
 echo "==> checking for bootloader on $PORT"
-if ! python3 "$HERE/firmware_upload.py" probe "$PORT" 2>&1 | grep -q "bootloader mode"; then
-    echo "Bootloader did not answer." >&2
-    echo "Hold the bottom two side buttons while powering on, then retry." >&2
-    exit 1
+if python3 "$HERE/firmware_upload.py" probe "$PORT" 2>&1 | grep -q "bootloader mode"; then
+    echo "    already in bootloader mode"
+    MODE="--ptt"
+else
+    echo "    not in bootloader; trying the soft handshake"
+    MODE=""
 fi
 
 echo "==> uploading $(basename "$BTF")"
-if ! python3 "$HERE/firmware_upload.py" upload "$PORT" "$BTF" --ptt; then
+if ! python3 "$HERE/firmware_upload.py" upload "$PORT" "$BTF" $MODE; then
+    echo >&2
     echo "Upload failed." >&2
+    echo "If the running firmware is too broken to answer the handshake, use the" >&2
+    echo "guaranteed path: hold the bottom two side buttons while powering on," >&2
+    echo "then run this again." >&2
     exit 1
 fi
 

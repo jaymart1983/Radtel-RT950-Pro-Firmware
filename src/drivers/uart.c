@@ -28,6 +28,7 @@
  */
 
 #include "drivers/uart.h"
+#include "app/update_listener.h"
 #include "drivers/gpio.h"
 #include "rt950_pinmap.h"
 #include "cortex_m4.h"
@@ -62,6 +63,14 @@ void UART4_IRQHandler(void)
 {
     if (UART4->SR & USART_SR_RXNE) {
         uint8_t ch = (uint8_t)(UART4->DR & 0xFF);
+
+        /* Watch for the host's "enter update mode" handshake before buffering.
+         * This has to happen here, in the ISR, rather than anywhere that
+         * depends on the scheduler or on CPS draining the ring buffer -- the
+         * entire point is to be able to reflash a radio whose firmware is
+         * broken. */
+        update_listener_feed(ch);
+
         uint16_t next = (cps_rx_head + 1) & (UART_CPS_BUF_SIZE - 1);
         if (next != cps_rx_tail) {
             cps_rx_buf[cps_rx_head] = ch;
