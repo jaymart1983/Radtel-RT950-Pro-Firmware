@@ -78,6 +78,6 @@ assembly/.r2*
 .idea/
 
 # Diagnostic images and captured boot logs are build artifacts.
-images/
+images/*.BTF
 logs/
 *.BTF

@@ -336,13 +336,39 @@ void Reset_Handler(void)
 
 /* ========================================================================
  *  Default_Handler - Catch-all for unimplemented ISRs.
- *  Spins forever; attach a debugger to identify the fault source.
+ *
+ *  Reports which exception fired, then lets the watchdog reset the radio.
+ *
+ *  This was a bare `while (1) { bkpt #0 }`, which is the worst possible
+ *  behaviour during bring-up: NMI, MemManage, BusFault, UsageFault, SVCall,
+ *  PendSV and every unhandled peripheral IRQ all land here and hang in total
+ *  silence — indistinguishable from a main loop that runs but does nothing.
+ *
+ *  IPSR holds the active exception number:
+ *    2=NMI  3=HardFault  4=MemManage  5=BusFault  6=UsageFault
+ *    11=SVCall  14=PendSV  15=SysTick  16+n = external IRQ n
+ *
+ *  `bkpt #0` is deliberately gone: with no debugger attached it escalates to a
+ *  HardFault, so the fault you end up looking at is caused by the trap itself
+ *  rather than by the original problem.
  * ======================================================================== */
 
 void Default_Handler(void)
 {
+    uint32_t ipsr;
+    __asm volatile ("mrs %0, ipsr" : "=r" (ipsr));
+
+    /* Feed IWDG once so the message gets out before any reset. */
+    *(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL;
+
+    dbg_puts("\n[FAULT] Unhandled exception\n");
+    dbg_reg("[FAULT] IPSR=0x", ipsr);
+    if (ipsr >= 16u)
+        dbg_reg("[FAULT] external IRQ n=", ipsr - 16u);
+
+    /* Stop feeding the watchdog: a reset beats sitting bricked. */
     while (1) {
-        __asm volatile ("bkpt #0");
+        /* spin until IWDG fires */
     }
 }
 
