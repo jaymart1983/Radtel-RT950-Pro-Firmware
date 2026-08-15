@@ -129,9 +129,22 @@ typedef struct __attribute__((packed)) {
 /* Extended config: 0x00A000 ----------------------------------------- */
 #define FLASH_ADDR_DTMF         0x00A000    /* DTMF contacts + PTT config */
 #define FLASH_ADDR_SI4732       0x00B000    /* FM/AM/SSB channels + config */
-#define FLASH_ADDR_ZONE_NAMES   0x00C000    /* 10 zone names x 16 bytes */
-#define FLASH_ZONE_NAME_SIZE    16          /* 12 chars + padding */
-#define FLASH_ZONE_MAX          10
+/* Zone names. CORRECTED 2026-08-15: was 0x00C000, which is the DTMF/modulation
+ * region — reading zone names from there returns DTMF data.
+ *
+ * Verified two ways against a physical V0.29 radio:
+ *   1. OEM ZONE_DrawEntry does SPIFLASH_ReadBytes(zone * 0x10 + 0xA200, buf, 0xC)
+ *      and falls back to sprintf("%s %d", "Zone", n+1) when the first byte is 0xFF.
+ *   2. Writing 12-byte names at 0xA200 + n*0x10 made them appear in the radio's
+ *      own Zone menu.
+ * Matches Radtel's RT-900 source: BANK_NAME_ADDR 0xA200, BANK_NAME_SIZE 16.
+ *
+ * Note the stride is 16 but the OEM only READS 12 bytes, so bytes 12-15 of each
+ * slot are not part of the name. */
+#define FLASH_ADDR_ZONE_NAMES   0x00A200    /* zone names, 16-byte stride */
+#define FLASH_ZONE_NAME_STRIDE  16          /* slot pitch */
+#define FLASH_ZONE_NAME_SIZE    12          /* bytes the OEM actually reads */
+#define FLASH_ZONE_MAX          15          /* OEM zone mask is 15 bits wide */
 #define FLASH_ADDR_FM_NAMES     0x00D010    /* 15 FM channel names x 16B */
 #define FLASH_ADDR_AM_NAMES     0x00D110    /* 15 AM channel names x 16B */
 #define FLASH_ADDR_SSB_NAMES    0x00D210    /* 15 SSB channel names x 16B */
