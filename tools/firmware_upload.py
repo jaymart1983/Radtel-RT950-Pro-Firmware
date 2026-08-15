@@ -154,11 +154,18 @@ def parse_response(resp: bytes) -> dict:
 
 def serial_monitor(port: str, baud: int = DEFAULT_BAUD, timestamp: bool = True):
     """Monitor serial port output. Prints incoming data as text.
-    Ctrl+C to exit."""
-    import datetime
+    Ctrl+C to exit.
 
-    print(f"Monitoring {port} @ {baud} baud (Ctrl+C to stop)")
-    print("-" * 60)
+    Every print here flushes. Without that, piping the monitor to a file or
+    another process gets Python's default 8 KB block buffering, and a boot
+    trace of a few hundred bytes never reaches the far end -- it sits in the
+    buffer until the process exits, and is lost entirely if the monitor is
+    killed by a signal. That failure looks exactly like a radio that is not
+    printing anything, which is a very expensive thing to misdiagnose.
+    """
+
+    print(f"Monitoring {port} @ {baud} baud (Ctrl+C to stop)", flush=True)
+    print("-" * 60, flush=True)
 
     ser = serial.Serial(
         port=port,
@@ -185,17 +192,20 @@ def serial_monitor(port: str, baud: int = DEFAULT_BAUD, timestamp: bool = True):
                         prefix = f"[{elapsed:8.3f}] "
                     else:
                         prefix = ""
-                    print(f"{prefix}{line_buf}")
+                    print(f"{prefix}{line_buf}", flush=True)
                     line_buf = ""
                 elif ch == '\r':
                     continue
                 else:
                     line_buf += ch
     except KeyboardInterrupt:
-        if line_buf:
-            print(line_buf)
-        print("\n--- monitor stopped ---")
+        pass
     finally:
+        # Flush any partial line, so the last thing printed before a hang is
+        # not swallowed -- that line is usually the most informative one.
+        if line_buf:
+            print(line_buf, flush=True)
+        print("\n--- monitor stopped ---", flush=True)
         ser.close()
 
 
