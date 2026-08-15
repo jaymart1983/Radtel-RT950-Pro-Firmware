@@ -129,22 +129,30 @@ typedef struct __attribute__((packed)) {
 /* Extended config: 0x00A000 ----------------------------------------- */
 #define FLASH_ADDR_DTMF         0x00A000    /* DTMF contacts + PTT config */
 #define FLASH_ADDR_SI4732       0x00B000    /* FM/AM/SSB channels + config */
-/* Zone names. CORRECTED 2026-08-15: was 0x00C000, which is the DTMF/modulation
- * region — reading zone names from there returns DTMF data.
+/* Zone names live at 0x00C000. Confirmed by dumping a physical RT-950 Pro on
+ * V0.29: 0x00C000 holds the ten OEM default names "ZoneOne".."ZoneTen" at a
+ * 16-byte pitch, 0xFF-padded, with 0x00C0A0 onward erased.
  *
- * Verified two ways against a physical V0.29 radio:
- *   1. OEM ZONE_DrawEntry does SPIFLASH_ReadBytes(zone * 0x10 + 0xA200, buf, 0xC)
- *      and falls back to sprintf("%s %d", "Zone", n+1) when the first byte is 0xFF.
- *   2. Writing 12-byte names at 0xA200 + n*0x10 made them appear in the radio's
- *      own Zone menu.
- * Matches Radtel's RT-900 source: BANK_NAME_ADDR 0xA200, BANK_NAME_SIZE 16.
+ * This was briefly changed to 0xA200 and that change was WRONG. Two mistakes
+ * compounded:
  *
- * Note the stride is 16 but the OEM only READS 12 bytes, so bytes 12-15 of each
- * slot are not part of the name. */
-#define FLASH_ADDR_ZONE_NAMES   0x00A200    /* zone names, 16-byte stride */
+ *   1. A dump region had been hand-labelled "DTMF/modulation" at 0x00C000.
+ *      That label was a guess, but it was later treated as established fact,
+ *      which ruled out the correct address on no evidence at all.
+ *   2. Radtel's RT-900 source really does declare BANK_NAME_ADDR 0xA200 -- but
+ *      the RT-900 is a different radio (BT32F0x, Cortex-M0) and does not share
+ *      this layout. On the RT-950, 0xA200 is erased.
+ *
+ * The RT-900 source is a good guide to record STRUCTURE -- CHAN_SIZE 32, name
+ * at offset 20, 12 bytes -- all of which does match. It is NOT authoritative
+ * for absolute flash addresses; check those against a dump.
+ *
+ * Stride is 16 bytes, of which the first 12 hold text. The RT-900 header says
+ * the same ("supports 12 bytes, stored in 16") and the dump agrees. */
+#define FLASH_ADDR_ZONE_NAMES   0x00C000    /* 10 zone names, 16-byte stride */
 #define FLASH_ZONE_NAME_STRIDE  16          /* slot pitch */
-#define FLASH_ZONE_NAME_SIZE    12          /* bytes the OEM actually reads */
-#define FLASH_ZONE_MAX          15          /* OEM zone mask is 15 bits wide */
+#define FLASH_ZONE_NAME_SIZE    12          /* bytes of each slot used for text */
+#define FLASH_ZONE_MAX          10          /* ten default names present */
 #define FLASH_ADDR_FM_NAMES     0x00D010    /* 15 FM channel names x 16B */
 #define FLASH_ADDR_AM_NAMES     0x00D110    /* 15 AM channel names x 16B */
 #define FLASH_ADDR_SSB_NAMES    0x00D210    /* 15 SSB channel names x 16B */

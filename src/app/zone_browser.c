@@ -1,8 +1,9 @@
 /*
  * zone_browser.c - Zone selection browser for the RT-950 Pro
  *
- * Reads zone names from SPI flash at 0xA200, 16-byte stride, 12 bytes used.
- * Address verified against the OEM firmware and a physical radio.
+ * Reads zone names from SPI flash at 0x00C000, 16-byte stride, 12 bytes used.
+ * Address confirmed by dumping a physical radio: the ten OEM defaults
+ * "ZoneOne".."ZoneTen" are stored there.
  * User selects with encoder + MENU, cancels with EXIT.
  */
 
