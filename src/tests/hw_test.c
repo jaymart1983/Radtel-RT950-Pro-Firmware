@@ -223,56 +223,28 @@ static void draw_hex(uint16_t y, const char *label, uint32_t v, uint16_t col)
 void test_blinky(void)
 {
     test_debug_init();
-    dbg_println("=== ADC SCAN + SI4732 RETRY ===");
+    dbg_println("=== SI4732 POWER-UP RETRY ===");
 
-    /* --- Which ADC channel is the battery? ------------------------------
-     * adc_read_battery() returned 4 and PA0 raw was 66 of 4095 -- about 53 mV,
-     * far too low for a battery sense line. The pinmap contradicts itself:
-     * one comment names PA1 as ADC2_CH1 battery voltage, another says
-     * ADC_Read_PA0 is the battery sense.
-     *
-     * Scanning every channel settles it. A 2S pack sits near 7-8.4 V, and any
-     * sane divider puts that in the upper half of the range -- so the battery
-     * channel should read well above 2000. Reading them all also maps out what
-     * else is wired to the ADC. */
-    for (uint8_t ch = 0; ch <= 9; ch++) {
-        uint16_t v = adc_read_channel(ch);
-        dbg_puts("ADC ch"); dbg_dec(ch);
-        dbg_puts(" = ");    dbg_dec(v);
-        dbg_puts("  (");    dbg_dec((uint32_t)v * 3300u / 4095u);
-        dbg_puts(" mV at pin)");
-        dbg_newline();
-        delay_ms(20);
-    }
-
-    /* --- SI4732: why no response? ---------------------------------------
-     * si4732_get_rev() returned an error and all-zero data. The part needs a
-     * reset pulse and a power-up command before it will answer anything, so
-     * "no response" may simply mean it was never brought out of reset --
-     * hw_init may not do it, or may do it in a different order.
-     *
-     * Retry explicitly: reset, power up, then ask for the revision. Its
-     * response includes a fixed part number (0x32 for the Si4732), which is
-     * self-verifying -- if that byte comes back right, the chip is alive. */
-    dbg_println("SI4732: explicit reset + power up...");
     si4732_init();
-    delay_ms(100);
-    int rc_pu = si4732_power_up_fm();
-    dbg_puts("  power_up rc="); dbg_dec((uint32_t)(rc_pu < 0 ? 255 : rc_pu));
-    dbg_newline();
     delay_ms(200);
 
-    {
-        uint8_t rev[16] = {0};
-        int rc = si4732_get_rev(rev);
-        dbg_puts("  get_rev rc="); dbg_dec((uint32_t)(rc < 0 ? 255 : rc));
-        dbg_puts(" data:");
-        for (uint8_t i = 0; i < 9; i++) { dbg_puts(" "); dbg_hex8(rev[i]); }
-        dbg_puts("   (want part number 0x32)");
-        dbg_newline();
-    }
+    int rc_pu = si4732_power_up_fm();
+    dbg_puts("power_up_fm rc="); dbg_dec((uint32_t)(rc_pu < 0 ? 255 : rc_pu));
+    dbg_newline();
 
-    dbg_println("=== SCAN COMPLETE ===");
+    /* GET_REV returns a fixed part number for the family -- 0x32 for an
+     * Si4732 -- so a correct value here is self-verifying rather than just
+     * "some bytes came back". */
+    uint8_t rev[16] = {0};
+    int rc = si4732_get_rev(rev);
+    dbg_puts("get_rev rc="); dbg_dec((uint32_t)(rc < 0 ? 255 : rc));
+    dbg_puts(" data:");
+    for (uint8_t i = 0; i < 9; i++) { dbg_puts(" "); dbg_hex8(rev[i]); }
+    dbg_newline();
+    dbg_puts("part number = "); dbg_hex8(rev[1]);
+    dbg_println(rev[1] == 0x32 ? "  <- Si4732 CONFIRMED" : "  <- expected 0x32");
+
+    dbg_println("=== DONE ===");
     uint32_t hb = 0;
     while (1) { dbg_puts("hb "); dbg_dec(hb++); dbg_newline(); delay_ms(3000); }
 }

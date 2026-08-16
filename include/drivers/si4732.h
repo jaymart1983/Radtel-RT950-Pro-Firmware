@@ -65,8 +65,17 @@
 #define SI4732_FUNC_AM_RECV       0x01  /* FUNC bits[3:0] = AM/SW/LW receive */
 #define SI4732_FUNC_AM_SW_LW      0x01  /* Alias - AM/SW/LW share mode 0x01 */
 #define SI4732_FUNC_WB_RECV       0x03  /* FUNC bits[3:0] = Weather band receive */
-#define SI4732_POWERUP_PATCH      (1U << 4)  /* Enable firmware patch boot */
-#define SI4732_POWERUP_XOSCEN     (1U << 5)  /* Crystal oscillator enable */
+/* POWER_UP ARG1 bits, per the Si47xx datasheet:
+ *   bit7 CTSIEN  bit6 GPO2OEN  bit5 PATCH  bit4 XOSCEN  bits3-0 FUNC
+ *
+ * These two were SWAPPED here: PATCH was defined as bit 4 and XOSCEN as bit 5.
+ * The FM/AM power-up happens to send the right value (0x10 = XOSCEN, matching
+ * the OEM's [0x01, 0x10, 0x05]) only because it used the mis-named constant.
+ * Anyone reading the names would have concluded the driver requests a patch
+ * boot, which it does not -- and setting the real PATCH bit without then
+ * uploading a patch leaves the part waiting forever and never asserting CTS. */
+#define SI4732_POWERUP_XOSCEN     (1U << 4)  /* Crystal oscillator enable */
+#define SI4732_POWERUP_PATCH      (1U << 5)  /* Boot from an uploaded patch */
 
 /*
  * OEM POWER_UP ARG1 values from V0.27 binary:
@@ -180,6 +189,10 @@ int si4732_set_property(uint16_t prop, uint16_t value);
 
 /* Get chip revision. Writes part number to *part_number. Returns 0 on success. */
 int si4732_get_rev(uint8_t *part_number);
+
+/* Diagnostic: probe every 7-bit I2C address, store those that ACK, return the
+ * count. Used to confirm which address the receiver actually sits at. */
+uint8_t si4732_i2c_scan(uint8_t *found, uint8_t max);
 
 /* Read single status byte from SI4732 */
 uint8_t si4732_get_status(void);

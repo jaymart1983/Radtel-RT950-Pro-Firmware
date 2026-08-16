@@ -13,6 +13,8 @@
  */
 
 #include "drivers/si4732.h"
+
+extern void delay_ms(uint32_t ms);
 #include "drivers/gpio.h"
 #include "rt950_pinmap.h"
 
@@ -217,12 +219,21 @@ static int si4732_wait_cts(void)
 {
     uint8_t status;
 
-    for (int attempt = 0; attempt < 100; attempt++) {
-        if (i2c_read_resp(&status, 1) < 0)
-            continue;
-        if (status & SI4732_STATUS_CTS)
+    /* Poll for up to ~1 s in 1 ms steps.
+     *
+     * This used to spin 100 times with only i2c_delay() between -- microseconds
+     * in total. POWER_UP with XOSCEN set starts the 32.768 kHz crystal, and the
+     * datasheet allows roughly 500 ms for it to stabilise before the part will
+     * answer; this header's own warning says the same. So the wait always
+     * expired long before the chip could possibly be ready, and every power-up
+     * reported failure while the receiver was merely still starting.
+     *
+     * Command responses after start-up are quick, so the long ceiling costs
+     * nothing in normal use -- it is a timeout, not a delay. */
+    for (int attempt = 0; attempt < 1000; attempt++) {
+        if (i2c_read_resp(&status, 1) == 0 && (status & SI4732_STATUS_CTS))
             return 0;
-        i2c_delay();
+        delay_ms(1);
     }
     return -1;  /* timeout */
 }
@@ -454,13 +465,27 @@ int si4732_get_rev(uint8_t *part_number)
 
     if (i2c_send_cmd(cmd, sizeof(cmd)) < 0)
         return -1;
-    if (si4732_wait_cts() < 0)
-        return -1;
-    if (i2c_read_resp(resp, sizeof(resp)) < 0)
-        return -1;
 
-    *part_number = resp[1];
-    return 0;
+    /* Read the WHOLE response in one transaction and check CTS in its first
+     * byte, retrying the entire read until the chip is ready.
+     *
+     * This used to call si4732_wait_cts() -- which reads one status byte -- and
+     * then issue a SECOND read for the nine-byte response. On an Si47xx the
+     * response is a single read whose first byte is the status, so splitting it
+     * meant the status seen by the poll and the data read afterwards came from
+     * different transactions. It returned success with a status of 0x1F (CTS
+     * clear) and a part number of 0x00.
+     *
+     * Reading it as one transaction is both correct and simpler. */
+    for (int attempt = 0; attempt < 1000; attempt++) {
+        if (i2c_read_resp(resp, sizeof(resp)) == 0 &&
+            (resp[0] & SI4732_STATUS_CTS)) {
+            *part_number = resp[1];
+            return 0;
+        }
+        delay_ms(1);
+    }
+    return -1;
 }
 
 uint8_t si4732_get_status(void)
@@ -562,4 +587,30 @@ int si4732_ssb_set_agc(uint8_t agc_disable, uint8_t gain)
 {
     uint16_t val = agc_disable ? (uint16_t)(1 | ((uint16_t)gain << 1)) : 0;
     return si4732_set_property(SI4732_PROP_SSB_AGC_OVERRIDE, val);
+}
+
+/* ========================================================================
+ *  si4732_i2c_scan - probe every 7-bit address and report which ACK.
+ *
+ *  Diagnostic only. si4732_get_rev() returns a status byte of 0x3F -- CTS
+ *  clear, so the part never signals ready -- and power_up_fm() fails. One
+ *  likely cause is the address: the Si47xx family selects between two I2C
+ *  addresses depending on the state of its SEN pin at reset, and this driver
+ *  assumes 0x11 (0x22 write). If the fitted part strapped the other way it is
+ *  at 0x63, and every transaction would be talking to nothing.
+ *
+ *  Returns a bitmap is impractical over 128 addresses, so this writes the
+ *  responders into caller-supplied storage.
+ * ======================================================================== */
+uint8_t si4732_i2c_scan(uint8_t *found, uint8_t max)
+{
+    uint8_t n = 0;
+    for (uint8_t a = 1; a < 127 && n < max; a++) {
+        i2c_start();
+        int nack = i2c_write_byte((uint8_t)(a << 1));   /* write address */
+        i2c_stop();
+        if (!nack)
+            found[n++] = a;
+    }
+    return n;
 }
