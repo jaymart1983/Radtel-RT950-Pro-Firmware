@@ -48,6 +48,11 @@ HANDSHAKE_STRING = b"PROGRAMBT9000U"
 UPDATE_STRING    = b"UPDATE"
 ACK_BYTE         = 0x06
 HEADER           = 0xAA
+
+# Data-block transport tuning. See send_data() for why these exist.
+DATA_BLOCK_RETRIES = 5      # attempts per block before giving up
+DATA_BLOCK_DELAY   = 0.012  # settle time after each accepted block
+DATA_RETRY_DELAY   = 0.150  # longer pause after a failure, to let flash finish
 FOOTER           = 0x55
 
 # Bootloader commands
@@ -149,11 +154,18 @@ def parse_response(resp: bytes) -> dict:
 
 def serial_monitor(port: str, baud: int = DEFAULT_BAUD, timestamp: bool = True):
     """Monitor serial port output. Prints incoming data as text.
-    Ctrl+C to exit."""
-    import datetime
+    Ctrl+C to exit.
 
-    print(f"Monitoring {port} @ {baud} baud (Ctrl+C to stop)")
-    print("-" * 60)
+    Every print here flushes. Without that, piping the monitor to a file or
+    another process gets Python's default 8 KB block buffering, and a boot
+    trace of a few hundred bytes never reaches the far end -- it sits in the
+    buffer until the process exits, and is lost entirely if the monitor is
+    killed by a signal. That failure looks exactly like a radio that is not
+    printing anything, which is a very expensive thing to misdiagnose.
+    """
+
+    print(f"Monitoring {port} @ {baud} baud (Ctrl+C to stop)", flush=True)
+    print("-" * 60, flush=True)
 
     ser = serial.Serial(
         port=port,
@@ -180,17 +192,20 @@ def serial_monitor(port: str, baud: int = DEFAULT_BAUD, timestamp: bool = True):
                         prefix = f"[{elapsed:8.3f}] "
                     else:
                         prefix = ""
-                    print(f"{prefix}{line_buf}")
+                    print(f"{prefix}{line_buf}", flush=True)
                     line_buf = ""
                 elif ch == '\r':
                     continue
                 else:
                     line_buf += ch
     except KeyboardInterrupt:
-        if line_buf:
-            print(line_buf)
-        print("\n--- monitor stopped ---")
+        pass
     finally:
+        # Flush any partial line, so the last thing printed before a hang is
+        # not swallowed -- that line is usually the most informative one.
+        if line_buf:
+            print(line_buf, flush=True)
+        print("\n--- monitor stopped ---", flush=True)
         ser.close()
 
 
@@ -264,27 +279,76 @@ class FirmwareUploader:
         finally:
             self.ser.timeout = old_timeout
 
+    def _send_paced(self, data: bytes, gap: float = 0.02):
+        """Send one byte at a time with a gap, so the radio's matcher keeps up."""
+        for b in data:
+            self.ser.write(bytes([b]))
+            self.ser.flush()
+            time.sleep(gap)
+
+    def _wait_ack(self, what: str, timeout: float = 3.0) -> bool:
+        """Scan the incoming stream for an ACK rather than demanding it first.
+
+        A running radio may be emitting debug output on this same UART, so the
+        byte immediately after the handshake is frequently unrelated. Requiring
+        resp[0] == ACK made a perfectly good handshake look like a failure --
+        the reported "got: b6" was simply the first byte of a debug line.
+        """
+        deadline = time.time() + timeout
+        seen = bytearray()
+        while time.time() < deadline:
+            chunk = self.recv_raw(64, timeout=0.3)
+            if chunk:
+                seen.extend(chunk)
+                if ACK_BYTE in chunk:
+                    if len(seen) > 1:
+                        print(f"  {what} ACK found after {len(seen) - 1} bytes "
+                              f"of other output (debug traffic on the same UART)")
+                    else:
+                        print(f"  {what} ACK received")
+                    return True
+        print(f"  ERROR: No ACK to {what} "
+              f"(saw: {bytes(seen[:24]).hex() if seen else 'nothing'})")
+        return False
+
     def handshake(self) -> bool:
         """Phase 1: PROGRAMBT9000U + UPDATE handshake."""
         print("Phase 1: Entering update mode...")
 
-        # Step 1: Send handshake string
-        self.send_raw(HANDSHAKE_STRING)
+        # Clear anything already buffered, so a debug line sent before we
+        # started is not mistaken for a reply.
+        self.ser.reset_input_buffer()
 
-        resp = self.recv_raw(1, timeout=3.0)
-        if not resp or resp[0] != ACK_BYTE:
-            print(f"  ERROR: No ACK to handshake (got: {resp.hex() if resp else 'nothing'})")
-            return False
-        print("  Handshake ACK received")
+        # ACKs are best-effort, not a gate.
+        #
+        # The radio hands itself to the bootloader as soon as it recognises the
+        # sequence, and from that moment the far end is speaking the 0xAA-framed
+        # bootloader protocol rather than sending a bare 0x06. A missing ACK
+        # therefore proves nothing -- an earlier version aborted here having
+        # received "aa5200e10000c6b055", which IS the bootloader answering.
+        #
+        # What actually matters is whether the bootloader is now listening, and
+        # probe() already establishes that. So send the sequence, report what
+        # came back, and let the probe decide.
+        # Send the trigger strings PACED, one byte at a time.
+        #
+        # A back-to-back burst is not reliably matched: the radio counts every
+        # byte (rx increments correctly) but the matcher sees gaps, because the
+        # application is busy driving the bit-banged LCD and bytes coalesce at
+        # the UART before the handler observes them in order. Sent ~20 ms apart
+        # the same sequence matches every time.
+        #
+        # 14 + 6 bytes at 20 ms is under half a second, which is nothing next to
+        # a firmware upload, so there is no reason to be clever about it.
+        self._send_paced(HANDSHAKE_STRING)
+        got_hs = self._wait_ack("Handshake", timeout=2.0)
 
-        # Step 2: Send UPDATE command - MCU will ACK then reset
-        self.send_raw(UPDATE_STRING)
+        self._send_paced(UPDATE_STRING)
+        got_up = self._wait_ack("UPDATE", timeout=2.0)
 
-        resp = self.recv_raw(1, timeout=3.0)
-        if not resp or resp[0] != ACK_BYTE:
-            print(f"  ERROR: No ACK to UPDATE (got: {resp.hex() if resp else 'nothing'})")
-            return False
-        print("  UPDATE ACK received - radio entering bootloader mode")
+        if not (got_hs and got_up):
+            print("  (no clean ACK -- continuing; the probe decides)")
+        print("  Radio should now be in bootloader mode")
         return True
 
     def send_command(self, cmd: int, args: int = 0, data: bytes = b"",
@@ -452,13 +516,49 @@ class FirmwareUploader:
             if len(block) < DATA_BLOCK_SIZE:
                 block = block + b'\x00' * (DATA_BLOCK_SIZE - len(block))
 
-            resp = self.send_command(CMD_DATA, args=seq, data=block, timeout=10.0)
+            # Retry with resync.
+            #
+            # Without this, uploads failed at a DIFFERENT block each attempt
+            # ("Wrong data length" at 16, then 21). That error is the bootloader
+            # saying the frame it received did not match its length field, i.e.
+            # bytes went missing -- it is a transport fault, not bad data. The
+            # radio drops incoming bytes while it is busy erasing/writing a
+            # flash page, and with a 1029-byte packet already streaming there is
+            # nothing to stop the frame being chopped.
+            #
+            # Re-sending a block is safe: the sequence number is explicit in the
+            # packet (args=seq), so the bootloader writes the same destination
+            # regardless of how many times it is sent.
+            resp = None
+            for attempt in range(DATA_BLOCK_RETRIES):
+                if attempt:
+                    # Drop whatever partial frame desynced us, and give the
+                    # radio time to finish its flash write before trying again.
+                    self.ser.reset_input_buffer()
+                    self.ser.reset_output_buffer()
+                    time.sleep(DATA_RETRY_DELAY)
+
+                resp = self.send_command(CMD_DATA, args=seq, data=block,
+                                         timeout=10.0)
+                if resp is not None and resp["result"] == RESULT_ACK:
+                    break
+
+                why = "no response" if resp is None else resp["result_name"]
+                print(f"\n  block {seq}: {why}"
+                      f" (attempt {attempt + 1}/{DATA_BLOCK_RETRIES})")
+
             if resp is None:
-                print(f"\n  ERROR: No response to data block {seq}")
+                print(f"\n  ERROR: No response to data block {seq}"
+                      f" after {DATA_BLOCK_RETRIES} attempts")
                 return False
             if resp["result"] != RESULT_ACK:
-                print(f"\n  ERROR: Block {seq} rejected: {resp['result_name']}")
+                print(f"\n  ERROR: Block {seq} rejected: {resp['result_name']}"
+                      f" after {DATA_BLOCK_RETRIES} attempts")
                 return False
+
+            # Breathing room so the next packet does not arrive while the radio
+            # is still committing this one.
+            time.sleep(DATA_BLOCK_DELAY)
 
             # Progress bar
             pct = (seq + 1) * 100 // total_packages

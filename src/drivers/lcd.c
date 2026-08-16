@@ -29,21 +29,48 @@ extern void delay_ms(uint32_t ms);
 static inline void lcd_set_data(uint8_t byte)
 {
     /*
-     * Clear PD8-PD15, then set the desired bits.
-     * ODR bits [15:8] carry the data byte.
+     * Drive PD8-PD15 atomically via the set/clear registers.
+     *
+     * This was a read-modify-write of the whole ODR: read all 16 pins, mask the
+     * data byte in, write all 16 back. That silently reverts any change another
+     * context made to GPIOD between the read and the write -- and the keypad
+     * rows are PD4-PD7 on this very port, as are WR (PD0), CS (PD1) and DC
+     * (PD3). It survives only while nothing else touches GPIOD, which stops
+     * being true the moment the keypad is scanned.
+     *
+     * CLR then SCR is two atomic writes that affect only the data pins, so no
+     * other pin state can be lost, and no interrupt window exists at all.
      */
-    uint32_t odr = LCD_DATA_PORT->ODR;
-    odr &= ~(0xFFUL << LCD_DATA_SHIFT);
-    odr |= ((uint32_t)byte << LCD_DATA_SHIFT);
-    LCD_DATA_PORT->ODR = odr;
+    LCD_DATA_PORT->CLR = (0xFFUL << LCD_DATA_SHIFT);
+    if (byte)
+        LCD_DATA_PORT->SCR = ((uint32_t)byte << LCD_DATA_SHIFT);
 }
 
 /* Internal: pulse WR low -> high ------------------------------------- */
 static inline void lcd_pulse_wr(void)
 {
-    gpio_clear_pin(LCD_WR_PORT, LCD_WR_PIN);    /* WR low */
-    __asm volatile ("nop\n nop\n nop\n nop\n");  /* ~33 ns hold at 120 MHz */
-    gpio_set_pin(LCD_WR_PORT, LCD_WR_PIN);       /* WR high */
+    /*
+     * Widened from 4 NOPs (~33 ns at 120 MHz) and given explicit setup and
+     * hold time.
+     *
+     * 33 ns with no data setup is marginal for an 8080-bus panel, and marginal
+     * timing here does more than blur pixels: a strobe missed or doubled during
+     * lcd_set_window() shifts the command stream, so the ADDRESS WINDOW lands
+     * somewhere else and every subsequent pixel is written to the wrong part of
+     * the panel. That is what corrupted text drawn earlier at boot -- writes
+     * were escaping their intended rectangle entirely.
+     *
+     * The data pins are set by the caller immediately before this, so the NOPs
+     * before WR falls are the setup time; those after it are the low-pulse
+     * width. Cheap insurance: the whole frame is a few milliseconds either way.
+     */
+    __asm volatile ("nop\n nop\n nop\n nop\n");            /* data setup */
+    gpio_clear_pin(LCD_WR_PORT, LCD_WR_PIN);                  /* WR low */
+    __asm volatile ("nop\n nop\n nop\n nop\n"
+                    "nop\n nop\n nop\n nop\n"
+                    "nop\n nop\n nop\n nop\n");            /* ~100 ns low */
+    gpio_set_pin(LCD_WR_PORT, LCD_WR_PIN);                    /* WR high, latch */
+    __asm volatile ("nop\n nop\n nop\n nop\n");            /* hold */
 }
 
 /* ========================================================================

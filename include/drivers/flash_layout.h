@@ -129,9 +129,30 @@ typedef struct __attribute__((packed)) {
 /* Extended config: 0x00A000 ----------------------------------------- */
 #define FLASH_ADDR_DTMF         0x00A000    /* DTMF contacts + PTT config */
 #define FLASH_ADDR_SI4732       0x00B000    /* FM/AM/SSB channels + config */
-#define FLASH_ADDR_ZONE_NAMES   0x00C000    /* 10 zone names x 16 bytes */
-#define FLASH_ZONE_NAME_SIZE    16          /* 12 chars + padding */
-#define FLASH_ZONE_MAX          10
+/* Zone names live at 0x00C000. Confirmed by dumping a physical RT-950 Pro on
+ * V0.29: 0x00C000 holds the ten OEM default names "ZoneOne".."ZoneTen" at a
+ * 16-byte pitch, 0xFF-padded, with 0x00C0A0 onward erased.
+ *
+ * This was briefly changed to 0xA200 and that change was WRONG. Two mistakes
+ * compounded:
+ *
+ *   1. A dump region had been hand-labelled "DTMF/modulation" at 0x00C000.
+ *      That label was a guess, but it was later treated as established fact,
+ *      which ruled out the correct address on no evidence at all.
+ *   2. Radtel's RT-900 source really does declare BANK_NAME_ADDR 0xA200 -- but
+ *      the RT-900 is a different radio (BT32F0x, Cortex-M0) and does not share
+ *      this layout. On the RT-950, 0xA200 is erased.
+ *
+ * The RT-900 source is a good guide to record STRUCTURE -- CHAN_SIZE 32, name
+ * at offset 20, 12 bytes -- all of which does match. It is NOT authoritative
+ * for absolute flash addresses; check those against a dump.
+ *
+ * Stride is 16 bytes, of which the first 12 hold text. The RT-900 header says
+ * the same ("supports 12 bytes, stored in 16") and the dump agrees. */
+#define FLASH_ADDR_ZONE_NAMES   0x00C000    /* 10 zone names, 16-byte stride */
+#define FLASH_ZONE_NAME_STRIDE  16          /* slot pitch */
+#define FLASH_ZONE_NAME_SIZE    12          /* bytes of each slot used for text */
+#define FLASH_ZONE_MAX          10          /* ten default names present */
 #define FLASH_ADDR_FM_NAMES     0x00D010    /* 15 FM channel names x 16B */
 #define FLASH_ADDR_AM_NAMES     0x00D110    /* 15 AM channel names x 16B */
 #define FLASH_ADDR_SSB_NAMES    0x00D210    /* 15 SSB channel names x 16B */

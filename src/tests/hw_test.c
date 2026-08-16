@@ -2,7 +2,15 @@
  * hw_test.c - Hardware test suite for RT-950 Pro bring-up
  *
  * Each test is standalone and exercises one peripheral subsystem.
- * Output goes to USART1 (Bluetooth/debug port) at 115200 baud.
+ *
+ * Output goes to UART4 (PC10/PC11) at 115200 baud -- the programming cable.
+ *
+ * These helpers used to write to USART1, the Bluetooth port, which is NOT
+ * connected to the programming cable. Every test printed diagnostics that
+ * nothing could receive, so the whole suite looked mute on a bench setup and
+ * a working test was indistinguishable from a dead radio. They deliberately
+ * shadow the global dbg_* from debug_uart.h, so the mistake was invisible at
+ * the call sites.
  *
  * Build with:  make test TEST=N
  * Flash via:   tools/encrypt_btf.py to create flashable BTF
@@ -21,25 +29,94 @@
 #include "drivers/dac_audio.h"
 #include "drivers/lcd.h"
 #include "app/display.h"
+#include "app/font.h"
 #include "app/keypad.h"
+#include "app/update_listener.h"
 #include "app/encoder.h"
 #include "app/gps.h"
+#include "app/power.h"
 
 extern void delay_ms(uint32_t ms);
 extern uint32_t get_tick(void);
+
+/* Bring up UART4 for test output. dbg_init() only runs in DEBUG builds, so the
+ * tests cannot rely on it; uart_cps_init() configures the same peripheral at
+ * 115200 either way. Safe to call twice. */
+static void test_debug_init(void)
+{
+    uart_acc_init();   /* UART4 on PC10/PC11 -- the programming cable */
+}
+
+
+/* ---------------------------------------------------------------------------
+ * On-screen debug console
+ *
+ * Mirrors every debug line to the LCD as well as the UART. The point is to
+ * make the firmware's INTENT observable without depending on the serial link:
+ * if the screen shows the counter climbing but the cable stays silent, the
+ * fault is isolated to UART TX and the firmware is fine. Without this, a mute
+ * cable and a dead radio look identical -- which has already cost several
+ * test cycles.
+ * ------------------------------------------------------------------------- */
+
+#define CON_ROWS      18
+#define CON_ROW_H     12
+#define CON_TOP       84          /* below the colour bars */
+#define CON_COLS      38
+
+static char     con_line[CON_COLS + 1];
+static uint8_t  con_pos;
+static uint8_t  con_row;
+static uint8_t  con_ready;        /* only draw once lcd_init() has run */
+
+static void con_enable(void)   __attribute__((unused));
+static void con_enable(void)   { con_ready = 1; con_row = 0; con_pos = 0; }
+
+static void con_flush(void)
+{
+    if (!con_ready) { con_pos = 0; return; }
+    con_line[con_pos] = '\0';
+
+    /* Wrap by wiping the console area, so old text never overlaps new. */
+    if (con_row >= CON_ROWS) {
+        con_row = 0;
+        lcd_fill_rect(0, CON_TOP, LCD_WIDTH,
+                      (uint16_t)(CON_ROWS * CON_ROW_H), COLOR_BLACK);
+    }
+
+    /* Clear this row first: shorter lines would otherwise leave a tail. */
+    lcd_fill_rect(0, (uint16_t)(CON_TOP + con_row * CON_ROW_H),
+                  LCD_WIDTH, CON_ROW_H, COLOR_BLACK);
+    font_draw_string(FONT_SMALL, 2,
+                     (uint16_t)(CON_TOP + con_row * CON_ROW_H),
+                     con_line, COLOR_WHITE, COLOR_BLACK);
+    con_row++;
+    con_pos = 0;
+}
+
+static void con_putc(char c)
+{
+    if (c == '\n') { con_flush(); return; }
+    if (c == '\r') return;
+    if (con_pos < CON_COLS) con_line[con_pos++] = c;
+}
 
 /* Debug output helpers ------------------------------------------------ */
 
 static void dbg_puts(const char *s)
 {
-    while (*s)
-        uart_send_byte(USART1, (uint8_t)*s++);
+    while (*s) {
+        uart_send_byte(UART4, (uint8_t)*s);
+        con_putc(*s);
+        s++;
+    }
 }
 
 static void dbg_newline(void)
 {
-    uart_send_byte(USART1, '\r');
-    uart_send_byte(USART1, '\n');
+    uart_send_byte(UART4, '\r');
+    uart_send_byte(UART4, '\n');
+    con_flush();
 }
 
 static void dbg_println(const char *s)
@@ -51,8 +128,10 @@ static void dbg_println(const char *s)
 static void dbg_hex8(uint8_t v)
 {
     static const char hex[] = "0123456789ABCDEF";
-    uart_send_byte(USART1, hex[v >> 4]);
-    uart_send_byte(USART1, hex[v & 0xF]);
+    uart_send_byte(UART4, hex[v >> 4]);
+    uart_send_byte(UART4, hex[v & 0xF]);
+    con_putc(hex[v >> 4]);
+    con_putc(hex[v & 0xF]);
 }
 
 static void dbg_hex16(uint16_t v)
@@ -66,15 +145,19 @@ static void dbg_dec(uint32_t v)
     char buf[12];
     int i = 0;
     if (v == 0) {
-        uart_send_byte(USART1, '0');
+        uart_send_byte(UART4, '0');
+        con_putc('0');
         return;
     }
     while (v > 0) {
         buf[i++] = '0' + (char)(v % 10);
         v /= 10;
     }
-    while (i > 0)
-        uart_send_byte(USART1, (uint8_t)buf[--i]);
+    while (i > 0) {
+        char c = buf[--i];
+        uart_send_byte(UART4, (uint8_t)c);
+        con_putc(c);
+    }
 }
 
 /* ==========================================================================
@@ -82,27 +165,104 @@ static void dbg_dec(uint32_t v)
  *  Confirms: GPIO output, clock init, SysTick
  * ========================================================================== */
 
+__attribute__((unused))
+static void draw_kv(uint16_t y, const char *label, uint32_t v, uint16_t col)
+{
+    char b[32]; uint8_t n = 0;
+    while (*label) b[n++] = *label++;
+    char t[12]; int ti = 0;
+    if (!v) t[ti++] = '0';
+    while (v) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+    while (ti) b[n++] = t[--ti];
+    b[n++] = ' '; b[n++] = ' '; b[n] = '\0';
+    lcd_draw_string(6, y, b, col, 0x0000);
+}
+
+__attribute__((unused))
+static void draw_hex(uint16_t y, const char *label, uint32_t v, uint16_t col)
+{
+    static const char H[] = "0123456789ABCDEF";
+    char b[32]; uint8_t n = 0;
+    while (*label) b[n++] = *label++;
+    b[n++] = H[(v >> 4) & 0xF];
+    b[n++] = H[v & 0xF];
+    b[n++] = ' '; b[n++] = ' '; b[n] = '\0';
+    lcd_draw_string(6, y, b, col, 0x0000);
+}
+
 void test_blinky(void)
 {
-    uart_bt_init();
-    dbg_println("=== TEST 1: Blinky (LCD backlight PC6) ===");
+    test_debug_init();
 
-    gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN,
+    /* Hold the power latch, exactly as the real firmware does. */
+    gpio_config_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN,
                     GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
 
-    uint32_t count = 0;
+    gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
+    lcd_init();
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x0000);
+
+    keypad_init();
+    power_init();
+
+    lcd_draw_string(6,  4, "PA11 POWER-OFF TEST", 0xFFE0, 0x0000);
+    lcd_draw_string(6, 18, "1 = PA11 HIGH", 0x07E0, 0x0000);
+    lcd_draw_string(6, 30, "3 = PA11 LOW", 0x07E0, 0x0000);
+    lcd_draw_string(6, 42, "7 = release (input)", 0x07FF, 0x0000);
+    lcd_draw_string(6, 60, "knob OFF = normal path", 0xFFFF, 0x0000);
+    dbg_println("PA11 POWER-OFF TEST");
+
+    /* PA11 is documented in the pinmap as "DEVICE POWER OFF - software
+     * power-off trigger" and NOTHING in this codebase drives it. Releasing the
+     * PB9 enable latch demonstrably does not collapse the rail -- proved by the
+     * CPU still running afterwards to notice the knob and reset itself -- so
+     * PA11 is the likely real mechanism for a genuine hardware power cut.
+     *
+     * Polarity is unknown and guessing costs a flash cycle each way, so both
+     * are bound to keys. PA11 starts as a floating INPUT: driving an unknown
+     * power rail at boot is how radios get bricked, and leaving it high-Z
+     * matches the state it has had all along.
+     *
+     * Note PA11 is NOT the side button -- that is PA12 (BOT_PROG). No conflict
+     * with bootloader entry. */
+    GPIO_TypeDef *A = (GPIO_TypeDef *)GPIOA_BASE;
+    gpio_config_pin(A, GPIO_PIN_11, GPIO_MODE_INPUT, GPIO_CNF_FLOATING);
+
+    uint32_t hb = 0;
+    const char *state = "input(hi-Z)";
+
     while (1) {
-        gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
-        dbg_puts("ON  #");
-        dbg_dec(count++);
-        dbg_newline();
-        delay_ms(500);
+        power_button_poll();
 
-        gpio_clear_pin(LCD_BL_PORT, LCD_BL_PIN);
-        dbg_puts("OFF #");
-        dbg_dec(count++);
-        dbg_newline();
-        delay_ms(500);
+        key_event_t ev;
+        if (keypad_get_event(&ev) && ev.type == KEY_EVT_PRESS) {
+            if (ev.key == KEY_1) {
+                dbg_println("[PA11] drive HIGH");
+                gpio_config_pin(A, GPIO_PIN_11, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+                gpio_set_pin(A, GPIO_PIN_11);
+                state = "HIGH";
+            } else if (ev.key == KEY_3) {
+                dbg_println("[PA11] drive LOW");
+                gpio_config_pin(A, GPIO_PIN_11, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+                gpio_clear_pin(A, GPIO_PIN_11);
+                state = "LOW";
+            } else if (ev.key == KEY_7) {
+                dbg_println("[PA11] release to input");
+                gpio_config_pin(A, GPIO_PIN_11, GPIO_MODE_INPUT, GPIO_CNF_FLOATING);
+                state = "input(hi-Z)";
+            }
+            lcd_fill_rect(1, 80, LCD_WIDTH - 2, 20, 0x0000);
+            lcd_draw_string(6, 84, "PA11:", 0xFFFF, 0x0000);
+            lcd_draw_string(56, 84, state, 0xFFE0, 0x0000);
+        }
+
+        if ((hb % 50u) == 0u) {
+            dbg_puts("alive PA11="); dbg_puts(state); dbg_newline();
+        }
+        hb++;
+        delay_ms(20);
     }
 }
 
@@ -114,6 +274,7 @@ void test_blinky(void)
 void test_uart_echo(void)
 {
     uart_bt_init();
+    test_debug_init();
     uart_gps_init();
     dbg_println("=== TEST 2: UART Echo ===");
     dbg_println("BT(USART1): echo mode  |  GPS(USART3): passthrough to BT");
@@ -122,12 +283,12 @@ void test_uart_echo(void)
         /* Echo BT input */
         if (uart_bt_rx_available()) {
             uint8_t c = uart_bt_rx_read();
-            uart_send_byte(USART1, c);
+            uart_send_byte(UART4, c);
         }
         /* Forward GPS to BT */
         if (gps_rx_available()) {
             uint8_t c = gps_rx_read();
-            uart_send_byte(USART1, c);
+            uart_send_byte(UART4, c);
         }
     }
 }
@@ -140,6 +301,7 @@ void test_uart_echo(void)
 void test_lcd_pattern(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 3: LCD Test Pattern ===");
 
     /* LCD backlight on */
@@ -183,6 +345,7 @@ void test_lcd_pattern(void)
 void test_bk4829_id(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 4: BK4829 Chip ID ===");
 
     bk4829_init(BK4829_CHIP0);
@@ -220,6 +383,7 @@ void test_bk4829_id(void)
 void test_si4732_rev(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 5: SI4732 Revision ===");
 
     si4732_init();
@@ -274,6 +438,7 @@ void test_si4732_rev(void)
 void test_spi_flash_id(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 6: SPI Flash JEDEC ID ===");
 
     spi2_init();
@@ -326,6 +491,7 @@ void test_spi_flash_id(void)
 void test_adc_monitor(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 7: ADC Monitor ===");
 
     adc_init();
@@ -359,6 +525,7 @@ void test_adc_monitor(void)
 void test_dac_tone(void)
 {
     uart_bt_init();
+    test_debug_init();
     dma_init();
     dbg_println("=== TEST 8: DAC 1kHz Tone on PA4 ===");
 
@@ -397,6 +564,7 @@ void test_dac_tone(void)
 void test_keypad_encoder(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 9: Keypad + Encoder ===");
     dbg_println("Press keys or turn encoder. Output on USART1.");
 
@@ -451,6 +619,7 @@ void test_keypad_encoder(void)
 void test_gps_display(void)
 {
     uart_bt_init();
+    test_debug_init();
     uart_gps_init();
     dbg_println("=== TEST 10: GPS NMEA Display ===");
     dbg_println("Raw NMEA forwarded to USART1. Parsed data every 2s.");
@@ -462,7 +631,7 @@ void test_gps_display(void)
         /* Forward raw NMEA bytes to debug port */
         if (gps_rx_available()) {
             uint8_t c = gps_rx_read();
-            uart_send_byte(USART1, c);
+            uart_send_byte(UART4, c);
         }
 
         /* Periodic parsed data dump */
@@ -497,6 +666,7 @@ void test_gps_display(void)
 void test_full_diagnostic(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("========================================");
     dbg_println("  RT-950 Pro Custom Firmware Diagnostic");
     dbg_println("  Build: " __DATE__ " " __TIME__);

@@ -113,6 +113,39 @@ def extract_key(data: bytes) -> bytes:
     return data[KEY_OFFSET:KEY_OFFSET + KEY_LENGTH]
 
 
+def pad_to_block(firmware: bytearray) -> bytearray:
+    """Pad the firmware up to a whole number of 1024-byte upload blocks.
+
+    The final block of an upload does not land correctly on the radio. Flashing
+    a 9168-byte image gave byte-perfect content for the first 8 KB and garbage
+    in the tail -- confirmed by having the firmware checksum its own flash a
+    kilobyte at a time and comparing against the .bin:
+
+        BLK 0..7  match exactly
+        BLK 8     53907 expected, 93901 actual   <- last, partial block
+
+    That tail is where late .rodata lives, so the symptoms were font glyphs
+    rendering as garbage and string constants reading as random bytes, while
+    everything earlier in the image worked perfectly.
+
+    Padding with 0xFF -- erased-flash value -- makes every block full, so no
+    partial-block case arises at all.
+    """
+    rem = len(firmware) % BLOCK_SIZE
+    if rem:
+        firmware = bytearray(firmware) + bytearray(b"\xFF" * (BLOCK_SIZE - rem))
+
+    # Then add one whole sacrificial block.
+    #
+    # Padding to a block boundary was not enough: with the image at exactly ten
+    # full blocks the final one STILL did not land (BLK 8 read 106141 against
+    # 53907 expected). The bootloader does not commit the last block it is
+    # given. Appending a block of erased-value padding means the discarded
+    # block contains nothing the firmware needs.
+    firmware = bytearray(firmware) + bytearray(b"\xFF" * BLOCK_SIZE)
+    return firmware
+
+
 def build_btf(firmware: bytearray, key_bytes: bytes, expanded_key: bytes,
               key_block: bytes = None) -> bytearray:
     """
@@ -216,6 +249,15 @@ def main():
 
     with open(args.input, "rb") as f:
         data = bytearray(f.read())
+
+    # Encrypt direction only: pad the raw image so every upload block is full.
+    # See pad_to_block() -- a partial final block does not land on the radio.
+    if not args.decrypt:
+        before = len(data)
+        data = pad_to_block(data)
+        if len(data) != before:
+            print(f"Padded {before} -> {len(data)} bytes "
+                  f"({len(data)//BLOCK_SIZE} whole {BLOCK_SIZE}-byte blocks)")
 
     # Resolve key
     if args.auto:

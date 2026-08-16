@@ -28,6 +28,7 @@
  */
 
 #include "drivers/uart.h"
+#include "app/update_listener.h"
 #include "drivers/gpio.h"
 #include "rt950_pinmap.h"
 #include "cortex_m4.h"
@@ -60,8 +61,33 @@ void USART1_IRQHandler(void)
 
 void UART4_IRQHandler(void)
 {
-    if (UART4->SR & USART_SR_RXNE) {
+    uint32_t sr = UART4->SR;
+
+    /* Reading SR (above) then DR clears RXNE and every error flag at once.
+     *
+     * Both halves of this matter. Testing ONLY RXNE means an overrun leaves ORE
+     * set with DR untouched, so the interrupt re-fires forever and starves
+     * everything else until the watchdog resets -- easy to hit, because the
+     * bootloader drives this UART hard during an upload and hands over with ORE
+     * already set.
+     *
+     * But DISCARDING the byte on an error is just as wrong, and was the bug
+     * that made the update handshake never respond: with the radio transmitting
+     * continuously and nothing draining RX, ORE is set much of the time, so
+     * every genuine received byte was thrown away by the error path before it
+     * reached the listener. An overrun means an EARLIER byte was lost -- the one
+     * in DR right now is still good, so process it. */
+    if (sr & (USART_SR_RXNE | USART_SR_ORE | USART_SR_FE |
+              USART_SR_NE | USART_SR_PE)) {
         uint8_t ch = (uint8_t)(UART4->DR & 0xFF);
+
+        /* Watch for the host's "enter update mode" handshake before buffering.
+         * This has to happen here, in the ISR, rather than anywhere that
+         * depends on the scheduler or on CPS draining the ring buffer -- the
+         * entire point is to be able to reflash a radio whose firmware is
+         * broken. */
+        update_listener_feed(ch);
+
         uint16_t next = (cps_rx_head + 1) & (UART_CPS_BUF_SIZE - 1);
         if (next != cps_rx_tail) {
             cps_rx_buf[cps_rx_head] = ch;
@@ -132,6 +158,19 @@ void uart_acc_init(void)
 
     gpio_config_pin(CPS_TX_PORT, CPS_TX_PIN, GPIO_MODE_OUT_2MHZ, GPIO_CNF_AF_PP);
     gpio_config_pin(CPS_RX_PORT, CPS_RX_PIN, GPIO_MODE_INPUT, GPIO_CNF_FLOATING);
+
+    /* Reset CR2/CR3 before configuring.
+     *
+     * These were never written anywhere in this codebase, so the peripheral
+     * kept whatever stop-bit, clock and flow-control settings the previous
+     * owner left behind. That matters here specifically: the bootloader drives
+     * UART4 hard during a firmware upload and hands straight over to the
+     * application, so its framing configuration was still in force. The result
+     * was consistent per-byte corruption -- "tick #" always arrived as the same
+     * wrong six bytes while digits and CRLF came through clean, which reads
+     * like a baud error but is not one. */
+    UART4->CR2 = 0;    /* 1 stop bit, no clock output, no LIN */
+    UART4->CR3 = 0;    /* no flow control, no DMA, no smartcard/IrDA */
 
     UART4->BRR = 521;
     UART4->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;

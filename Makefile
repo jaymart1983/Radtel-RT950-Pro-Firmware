@@ -51,6 +51,10 @@ SRCS = \
 	$(SRC_DIR)/app/text_input.c \
 	$(SRC_DIR)/app/dtmf_contacts.c \
 	$(SRC_DIR)/app/zone_browser.c \
+	$(SRC_DIR)/app/zone_filter.c \
+	$(SRC_DIR)/app/update_listener.c \
+	$(SRC_DIR)/app/updater.c \
+	$(SRC_DIR)/app/channel_picker.c \
 	$(SRC_DIR)/app/bluetooth.c \
 	$(SRC_DIR)/app/noaa.c \
 	$(SRC_DIR)/app/crossband.c \
@@ -127,6 +131,12 @@ endif
 # Debug UART output: make DEBUG=1
 ifdef DEBUG
 CFLAGS += -DDEBUG_UART
+endif
+
+# Build without the soft update listener: make NOLISTENER=1
+# Useful as a control when isolating whether the listener itself is at fault.
+ifdef NOLISTENER
+CFLAGS += -DNO_UPDATE_LISTENER
 endif
 test:
 ifndef TEST

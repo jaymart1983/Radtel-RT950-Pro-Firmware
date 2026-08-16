@@ -50,7 +50,21 @@ void delay_ms(uint32_t ms)
 {
     uint32_t start = systick_ms;
     while ((systick_ms - start) < ms) {
-        /* spin */
+        /* Feed the watchdog while spinning.
+         *
+         * The bootloader enables IWDG before jumping to the application (see
+         * the note in SystemInit above), so anything that blocks for longer
+         * than the IWDG period resets the radio. Every HW_TEST is shaped as
+         * `while (1) { ...; delay_ms(500); }` and none of them fed it, so each
+         * one reset roughly once a second. That presents as a boot loop into
+         * the bootloader and completely hides whatever the test was meant to
+         * show — test 1 looked like a dead radio when it was actually working.
+         *
+         * Feeding here instead of in each test loop fixes all eleven at once,
+         * and is right in principle: a bounded delay is not a hang, so it
+         * should not trip the watchdog. Real lockups still reset, because they
+         * are not sitting inside delay_ms(). */
+        *(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL;
     }
 }
 

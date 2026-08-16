@@ -100,6 +100,18 @@ SECTIONS
     {
         . = ALIGN(4);
         _sdata = .;
+
+        /* Code that must execute from RAM.
+         *
+         * The in-application updater erases and rewrites the flash it would
+         * otherwise be running from, so it cannot live there. Placing it in
+         * .data means startup copies it to SRAM alongside initialised data,
+         * and it runs from there with no flash accesses at all. Everything it
+         * calls must be in this section too -- a single call back into flash
+         * mid-erase hangs the CPU. */
+        *(.ramfunc)
+        *(.ramfunc*)
+
         *(.data)
         *(.data*)
         . = ALIGN(4);

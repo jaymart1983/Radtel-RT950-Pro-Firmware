@@ -23,9 +23,38 @@
 
 #ifdef HW_TEST
 #include "tests/hw_test.h"
+#include "app/update_listener.h"
 
 int main(void)
 {
+    /* PB9 POWER LATCH FIRST -- before anything else whatsoever.
+     *
+     * The power/volume knob only applies power momentarily; the firmware has to
+     * grab this latch within milliseconds or the radio dies before it finishes
+     * booting. The normal main() does this as its first action for exactly that
+     * reason, but the HW_TEST main() did not, so a test build could power off
+     * cleanly and then refuse to power back on -- the knob would apply power,
+     * the firmware would still be initialising, and it would drop dead again.
+     * Recovering needed a battery pull.
+     *
+     * Bare register writes, not gpio_config_pin(), so this happens before any
+     * driver is touched: GPIOB clock on, PB9 as 2 MHz push-pull output, set. */
+    {
+        volatile uint32_t *apb2en = (volatile uint32_t *)0x40021018UL;
+        *apb2en |= (1UL << 3);                       /* IOPBEN */
+        volatile uint32_t *crh = (volatile uint32_t *)(0x40010C00UL + 0x04UL);
+        uint32_t v = *crh;
+        v &= ~(0xFUL << 4);                          /* PB9 = CRH bits [7:4] */
+        v |=  (0x2UL << 4);                          /* mode 10 (2 MHz), cnf 00 */
+        *crh = v;
+        *(volatile uint32_t *)(0x40010C00UL + 0x10UL) = (1UL << 9);  /* SCR: PB9 high */
+    }
+
+    /* Arm the soft update listener in the hardware tests too. Without it, every
+     * rung of the bring-up ladder would need the side-button + battery-pull
+     * dance to move to the next one, which is most of the cost of testing. */
+    update_listener_init();
+
 #if   HW_TEST == 1
     test_blinky();
 #elif HW_TEST == 2
@@ -80,6 +109,10 @@ int main(void)
 #include "app/fm_radio.h"
 #include "app/channel.h"
 #include "app/menu.h"
+#include "app/channel_picker.h"
+#include "app/zone_filter.h"
+#include "app/zone_browser.h"
+#include "app/update_listener.h"
 #include "app/freq_entry.h"
 #include "app/dtmf.h"
 #include "app/splash.h"
@@ -112,6 +145,7 @@ extern uint32_t get_tick(void);
 #define TICK_BUTTONS_MS     20      /* 50 Hz PTT + side button monitor */
 #define TICK_AUDIO_MS       5       /* 200 Hz audio tone management */
 #define TICK_CPS_MS         50      /* 20 Hz CPS programming poll */
+#define TICK_UI_MS          10      /* 100 Hz UI event dispatch */
 
 /* Feed IWDG early - bootloader enables watchdog before jumping to us */
 #define IWDG_FEED()  (*(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL)
@@ -515,6 +549,19 @@ int main(void)
                     GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
     IWDG_FEED();
+
+    /* Arm the soft update listener BEFORE anything else.
+     *
+     * Placed here on purpose: everything below can fail, and the whole point of
+     * this listener is to reflash a radio whose firmware is broken. It runs
+     * from the UART4 RX interrupt, so it survives a hung main loop or a wedged
+     * scheduler. Send the normal handshake with firmware_upload.py (no --ptt)
+     * and the radio hands itself to the bootloader -- no side buttons, no
+     * battery pull.
+     *
+     * The side-button entry remains the guaranteed path: this cannot survive a
+     * fault that kills interrupts. */
+    update_listener_init();
 
     /* Initialize event queue */
     event_init();
@@ -928,6 +975,96 @@ static void hw_init(void)
  *  runtime via sched_enable() as peripherals are brought online.
  * ======================================================================== */
 
+
+/* ----------------------------------------------------------------------
+ * task_ui - UI event dispatcher
+ *
+ * The first consumer of the event queue. Until now every input task posted
+ * events and nothing ever called event_poll(), so the queue simply filled and
+ * dropped its oldest entries; input was visible only as debug UART output.
+ *
+ * Responsibilities, in order:
+ *   1. Service the channel picker's idle timeout.
+ *   2. Drain the queue, offering each input event to the picker first.
+ *      The picker returns PICKER_IDLE when it is closed, so events flow
+ *      through untouched when the overlay is not up.
+ *
+ * ui_current_ch is this layer's idea of the tuned channel. It changes ONLY on
+ * an explicit commit -- that is what makes the knob a browser rather than a
+ * tuner, and it is the entire point of the overlay.
+ * ---------------------------------------------------------------------- */
+
+static uint16_t ui_current_ch = 1;
+
+/* Apply a committed selection. Kept separate so that the eventual "actually
+ * retune the RF chain" call has one obvious home. */
+static void ui_commit_channel(uint16_t ch_num)
+{
+    ui_current_ch = ch_num;
+    dbg_puts("[UI] channel commit ");
+    dbg_reg("", ch_num);
+
+    channel_t ch;
+    if (channel_load((uint16_t)(ch_num - 1), &ch) == 0) {
+        channel_to_vfo(&ch, 0);
+    }
+}
+
+static void task_ui(void)
+{
+    /* Timeout fires once and cancels, leaving the tuned channel untouched. */
+    if (channel_picker_tick() == PICKER_CANCEL)
+        dbg_puts("[UI] picker timed out\n");
+
+    event_t ev;
+    while (event_poll(&ev)) {
+        switch (ev.type) {
+
+        case EVT_ENCODER_CW:
+        case EVT_ENCODER_CCW: {
+            int8_t dir = (ev.type == EVT_ENCODER_CW) ? +1 : -1;
+
+            /* The zone checklist owns the knob while it is open. */
+            if (zone_browser_is_active()) {
+                zone_browser_handle_encoder(dir);
+                break;
+            }
+            channel_picker_handle_encoder(dir, ui_current_ch);
+            break;
+        }
+
+        case EVT_KEY_PRESS: {
+            uint8_t key = (uint8_t)ev.param;
+
+            if (zone_browser_is_active()) {
+                zone_browser_handle_key(key);
+                break;
+            }
+
+            picker_result_t r = channel_picker_handle_key(key);
+            if (r == PICKER_COMMIT) {
+                ui_commit_channel(channel_picker_get_selection());
+                break;
+            }
+            if (r != PICKER_IDLE) break;   /* picker consumed or cancelled */
+
+            /* PROVISIONAL: '*' opens the zone checklist. This belongs behind a
+             * Menu entry, and moves there once the menu system routes to
+             * submodules -- it is a key binding so the feature is reachable and
+             * testable on hardware now, not a considered choice of key. */
+            if (key == KEY_STAR) {
+                zone_browser_open();
+                break;
+            }
+            break;
+        }
+
+        default:
+            break;
+        }
+    }
+}
+
 static void app_init(void)
 {
     /* Boot splash (blocks ~1 s while LCD shows image) ---------------- */
@@ -980,6 +1117,12 @@ static void app_init(void)
     IWDG_FEED();
 
     /* Display last - shows fully-initialized state ------------------- */
+    /* Zone filter before display: the main screen shows the zone name of the
+     * tuned channel, and the picker needs the mask to scope its list. */
+    dbg_puts("[DBG] zone_filter_init...\n");
+    zone_filter_init();
+    IWDG_FEED();
+
     dbg_puts("[DBG] display_init...\n");
     display_init();
     IWDG_FEED();
@@ -1012,6 +1155,7 @@ static void app_init(void)
     sched_register("battery",   power_poll,            TICK_BATTERY_MS);
     sched_register("audio",     audio_poll,            TICK_AUDIO_MS);
     sched_register("cps",       task_cps,              TICK_CPS_MS);
+    sched_register("ui",        task_ui,               TICK_UI_MS);
 
     dbg_puts("[DBG] app_init complete\n");
 }

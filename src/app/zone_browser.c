@@ -1,9 +1,25 @@
 /*
- * zone_browser.c - Zone selection browser for the RT-950 Pro
+ * zone_browser.c - Zone visibility checklist for the RT-950 Pro
  *
- * Reads 10 zone names from SPI flash at 0x00C000.
- * Each name: 16 bytes, ASCII, 0xFF-padded.
- * User selects with encoder + MENU, cancels with EXIT.
+ * This was a zone SELECTOR: pick one zone, and the radio confines itself to it.
+ * It is now a CHECKLIST, because zones here are a filter rather than a mode
+ * (see zone_filter.h). Ticking a zone makes its channels reachable from the
+ * knob and the arrow keys; unticking hides them. Several zones are visible at
+ * once, which is the normal case -- you want GMRS and the local repeaters at
+ * the same time, not one or the other.
+ *
+ *   spin    move the cursor
+ *   MENU    toggle the zone under the cursor (saves immediately)
+ *   EXIT    close
+ *
+ * Toggling never changes which channel is tuned. Unticking the zone you are
+ * currently sitting in leaves you on that channel; it just stops appearing when
+ * you spin past. The last enabled zone cannot be unticked -- zone_filter
+ * refuses it -- because an empty list has no way out through the UI.
+ *
+ * Zone names come from SPI flash at 0x00C000, 16-byte stride, 12 bytes used.
+ * Confirmed by dumping a physical radio: the ten OEM defaults "ZoneOne" ..
+ * "ZoneTen" live there.
  */
 
 #include "app/zone_browser.h"
@@ -13,6 +29,7 @@
 #include "drivers/lcd.h"
 #include "drivers/spi.h"
 #include "drivers/flash_layout.h"
+#include "app/zone_filter.h"
 
 /* State ---------------------------------------------------------------- */
 
@@ -45,7 +62,8 @@ void zone_read_name(uint8_t index, char *buf)
     }
 
     uint8_t raw[FLASH_ZONE_NAME_SIZE];
-    uint32_t addr = FLASH_ADDR_ZONE_NAMES + (uint32_t)index * FLASH_ZONE_NAME_SIZE;
+    /* stride (16) and read length (12) differ — see flash_layout.h */
+    uint32_t addr = FLASH_ADDR_ZONE_NAMES + (uint32_t)index * FLASH_ZONE_NAME_STRIDE;
     spi_flash_read(addr, raw, FLASH_ZONE_NAME_SIZE);
 
     /* Copy, converting 0xFF padding to NUL */
@@ -64,8 +82,10 @@ void zone_browser_handle_key(uint8_t key)
     if (!active) return;
 
     if (key == KEY_C_MENU) {
-        selected = cursor;
-        active = 0;
+        /* Toggle rather than select-and-close. Staying open matters: ticking
+         * zones is usually done several at a time, and closing after each one
+         * would mean reopening the menu for every change. */
+        zone_toggle(cursor);
         return;
     }
 
@@ -95,7 +115,8 @@ void zone_browser_draw(void)
     lcd_fill_rect(0, 0, LCD_WIDTH, 200, COLOR_BLACK);
 
     /* Header */
-    font_draw_string(FONT_SMALL, 4, 4, "Zone Select", COLOR_YELLOW, COLOR_BLACK);
+    font_draw_string(FONT_SMALL, 4, 4, "Zones (show/hide)", COLOR_YELLOW,
+                     COLOR_BLACK);
     lcd_fill_rect(0, 18, LCD_WIDTH, 1, COLOR_DARK_GRAY);
 
     /* List all zones */
@@ -104,11 +125,18 @@ void zone_browser_draw(void)
 
     for (uint8_t i = 0; i < FLASH_ZONE_MAX; i++) {
         uint8_t is_sel = (i == cursor);
+        uint8_t on     = zone_is_enabled(i);
         uint16_t fg = is_sel ? COLOR_WHITE : COLOR_GRAY;
         uint16_t bg = is_sel ? COLOR_DARK_GRAY : COLOR_BLACK;
 
         if (is_sel)
             lcd_fill_rect(0, y, LCD_WIDTH, 16, bg);
+
+        /* Checkbox. Drawn as text so it works with the existing font and
+         * needs no glyph work: [x] ticked, [ ] unticked. */
+        const char *box = on ? "[x]" : "[ ]";
+        font_draw_string(FONT_SMALL, 4, y + 1, box,
+                         on ? COLOR_GREEN : COLOR_DARK_GRAY, bg);
 
         /* Zone number */
         char num[4];
@@ -117,15 +145,17 @@ void zone_browser_draw(void)
         num[2] = '.';
         num[3] = '\0';
         if (num[0] == '0') num[0] = ' ';
-        font_draw_string(FONT_SMALL, 4, y + 1, num, fg, bg);
+        font_draw_string(FONT_SMALL, 32, y + 1, num, fg, bg);
 
-        /* Zone name */
+        /* Zone name. A hidden zone is greyed even when the cursor is on it,
+         * so the ticked state stays readable at a glance. */
+        uint16_t name_fg = on ? fg : COLOR_DARK_GRAY;
         zone_read_name(i, name);
         if (name[0] == '\0') {
-            font_draw_string(FONT_SMALL, 30, y + 1, "(empty)",
+            font_draw_string(FONT_SMALL, 58, y + 1, "(empty)",
                              COLOR_DARK_GRAY, bg);
         } else {
-            font_draw_string(FONT_SMALL, 30, y + 1, name, fg, bg);
+            font_draw_string(FONT_SMALL, 58, y + 1, name, name_fg, bg);
         }
 
         y += 16;
@@ -133,6 +163,6 @@ void zone_browser_draw(void)
 
     /* Footer */
     lcd_fill_rect(0, y + 4, LCD_WIDTH, 1, COLOR_DARK_GRAY);
-    font_draw_string(FONT_SMALL, 4, y + 8, "MENU=Select  EXIT=Back",
+    font_draw_string(FONT_SMALL, 4, y + 8, "MENU=Toggle  EXIT=Back",
                      COLOR_GRAY, COLOR_BLACK);
 }

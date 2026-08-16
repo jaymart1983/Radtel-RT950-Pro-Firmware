@@ -261,6 +261,36 @@ void Reset_Handler(void)
 {
     uint32_t *src, *dst;
 
+    /* PB9 POWER LATCH -- the very first thing the CPU does.
+     *
+     * The power/volume knob applies power only momentarily. The firmware has to
+     * assert this latch to hold its own supply up, and the window is shorter
+     * than the boot path: asserting it at the top of main() was still too late,
+     * because SystemInit() runs first and spends time waiting for the PLL to
+     * lock. The radio powered off correctly but would not power back on -- the
+     * knob applied power, the CPU started booting, and the supply collapsed
+     * before it ever reached main().
+     *
+     * So it happens here, before .data is copied, before .bss is cleared,
+     * before SystemInit. Bare register writes only: nothing has been
+     * initialised yet, so this cannot depend on a driver, a global, or even a
+     * function call that might live in a section not yet set up.
+     *
+     *   CRM APB2EN (0x40021018) bit 3 -> GPIOB clock
+     *   GPIOB CRH  (0x40010C04) [7:4] -> PB9 = output 2 MHz push-pull
+     *   GPIOB SCR  (0x40010C10) bit 9 -> PB9 high
+     */
+    *(volatile uint32_t *)0x40021018UL |= (1UL << 3);   /* IOPBEN */
+    *(volatile uint32_t *)0x40021018UL;                  /* read-back fence */
+    {
+        volatile uint32_t *crh = (volatile uint32_t *)0x40010C04UL;
+        uint32_t v = *crh;
+        v &= ~(0xFUL << 4);
+        v |=  (0x2UL << 4);
+        *crh = v;
+    }
+    *(volatile uint32_t *)0x40010C10UL = (1UL << 9);     /* SCR: PB9 high */
+
 #ifdef DEBUG_UART
     /* Ultra-early debug: init UART4 with raw register writes.
      * No .data/.bss dependency - pure hardware register setup.
@@ -336,13 +366,39 @@ void Reset_Handler(void)
 
 /* ========================================================================
  *  Default_Handler - Catch-all for unimplemented ISRs.
- *  Spins forever; attach a debugger to identify the fault source.
+ *
+ *  Reports which exception fired, then lets the watchdog reset the radio.
+ *
+ *  This was a bare `while (1) { bkpt #0 }`, which is the worst possible
+ *  behaviour during bring-up: NMI, MemManage, BusFault, UsageFault, SVCall,
+ *  PendSV and every unhandled peripheral IRQ all land here and hang in total
+ *  silence — indistinguishable from a main loop that runs but does nothing.
+ *
+ *  IPSR holds the active exception number:
+ *    2=NMI  3=HardFault  4=MemManage  5=BusFault  6=UsageFault
+ *    11=SVCall  14=PendSV  15=SysTick  16+n = external IRQ n
+ *
+ *  `bkpt #0` is deliberately gone: with no debugger attached it escalates to a
+ *  HardFault, so the fault you end up looking at is caused by the trap itself
+ *  rather than by the original problem.
  * ======================================================================== */
 
 void Default_Handler(void)
 {
+    uint32_t ipsr;
+    __asm volatile ("mrs %0, ipsr" : "=r" (ipsr));
+
+    /* Feed IWDG once so the message gets out before any reset. */
+    *(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL;
+
+    dbg_puts("\n[FAULT] Unhandled exception\n");
+    dbg_reg("[FAULT] IPSR=0x", ipsr);
+    if (ipsr >= 16u)
+        dbg_reg("[FAULT] external IRQ n=", ipsr - 16u);
+
+    /* Stop feeding the watchdog: a reset beats sitting bricked. */
     while (1) {
-        __asm volatile ("bkpt #0");
+        /* spin until IWDG fires */
     }
 }
 
