@@ -29,7 +29,6 @@
 #include "drivers/lcd.h"
 #include "drivers/spi.h"
 #include "drivers/flash_layout.h"
-#include "app/zone_filter.h"
 
 /* State ---------------------------------------------------------------- */
 
@@ -85,7 +84,8 @@ void zone_browser_handle_key(uint8_t key)
         /* Toggle rather than select-and-close. Staying open matters: ticking
          * zones is usually done several at a time, and closing after each one
          * would mean reopening the menu for every change. */
-        zone_toggle(cursor);
+        selected = cursor;
+        active = 0;
         return;
     }
 
@@ -125,7 +125,7 @@ void zone_browser_draw(void)
 
     for (uint8_t i = 0; i < FLASH_ZONE_MAX; i++) {
         uint8_t is_sel = (i == cursor);
-        uint8_t on     = zone_is_enabled(i);
+        uint8_t on     = 1;   /* no filter state without zone_filter */
         uint16_t fg = is_sel ? COLOR_WHITE : COLOR_GRAY;
         uint16_t bg = is_sel ? COLOR_DARK_GRAY : COLOR_BLACK;
 

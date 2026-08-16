@@ -109,8 +109,6 @@ int main(void)
 #include "app/fm_radio.h"
 #include "app/channel.h"
 #include "app/menu.h"
-#include "app/channel_picker.h"
-#include "app/zone_filter.h"
 #include "app/zone_browser.h"
 #include "app/update_listener.h"
 #include "app/freq_entry.h"
@@ -996,8 +994,7 @@ static void hw_init(void)
 
 static uint16_t ui_current_ch = 1;
 
-/* Apply a committed selection. Kept separate so that the eventual "actually
- * retune the RF chain" call has one obvious home. */
+/* Apply a committed channel selection. */
 static void ui_commit_channel(uint16_t ch_num)
 {
     ui_current_ch = ch_num;
@@ -1005,60 +1002,32 @@ static void ui_commit_channel(uint16_t ch_num)
     dbg_reg("", ch_num);
 
     channel_t ch;
-    if (channel_load((uint16_t)(ch_num - 1), &ch) == 0) {
+    if (channel_load((uint16_t)(ch_num - 1), &ch) == 0)
         channel_to_vfo(&ch, 0);
-    }
 }
 
 static void task_ui(void)
 {
-    /* Timeout fires once and cancels, leaving the tuned channel untouched. */
-    if (channel_picker_tick() == PICKER_CANCEL)
-        dbg_puts("[UI] picker timed out\n");
-
+    /* First consumer of the event queue.
+     *
+     * The knob-picker and zone-filter overlays used to hang off this and have
+     * been removed. They were written before any of the hardware they depend on
+     * was verified and were never once executed; keeping untested code in main
+     * pretending to work is worse than not having it. The history has them. */
     event_t ev;
     while (event_poll(&ev)) {
         switch (ev.type) {
-
         case EVT_ENCODER_CW:
         case EVT_ENCODER_CCW: {
             int8_t dir = (ev.type == EVT_ENCODER_CW) ? +1 : -1;
-
-            /* The zone checklist owns the knob while it is open. */
-            if (zone_browser_is_active()) {
-                zone_browser_handle_encoder(dir);
-                break;
-            }
-            channel_picker_handle_encoder(dir, ui_current_ch);
+            uint16_t next = channel_find_next(ui_current_ch, dir);
+            if (next != 0xFFFF)
+                ui_commit_channel(next);
             break;
         }
-
-        case EVT_KEY_PRESS: {
-            uint8_t key = (uint8_t)ev.param;
-
-            if (zone_browser_is_active()) {
-                zone_browser_handle_key(key);
-                break;
-            }
-
-            picker_result_t r = channel_picker_handle_key(key);
-            if (r == PICKER_COMMIT) {
-                ui_commit_channel(channel_picker_get_selection());
-                break;
-            }
-            if (r != PICKER_IDLE) break;   /* picker consumed or cancelled */
-
-            /* PROVISIONAL: '*' opens the zone checklist. This belongs behind a
-             * Menu entry, and moves there once the menu system routes to
-             * submodules -- it is a key binding so the feature is reachable and
-             * testable on hardware now, not a considered choice of key. */
-            if (key == KEY_STAR) {
-                zone_browser_open();
-                break;
-            }
+        case EVT_KEY_PRESS:
+            /* Menu/VFO routing lands here once those exist. */
             break;
-        }
-
         default:
             break;
         }
@@ -1117,12 +1086,6 @@ static void app_init(void)
     IWDG_FEED();
 
     /* Display last - shows fully-initialized state ------------------- */
-    /* Zone filter before display: the main screen shows the zone name of the
-     * tuned channel, and the picker needs the mask to scope its list. */
-    dbg_puts("[DBG] zone_filter_init...\n");
-    zone_filter_init();
-    IWDG_FEED();
-
     dbg_puts("[DBG] display_init...\n");
     display_init();
     IWDG_FEED();

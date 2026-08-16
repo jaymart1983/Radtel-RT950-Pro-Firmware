@@ -24,7 +24,6 @@
 #include "app/power.h"
 #include "app/settings.h"
 #include "app/menu.h"
-#include "app/channel_picker.h"
 #include "app/zone_browser.h"
 #include "app/freq_entry.h"
 #include "app/aprs.h"
@@ -359,14 +358,6 @@ void display_update(void)
         return;
     }
 
-    /* Zone checklist: a full-screen overlay, so it replaces the screen and
-     * returns, same as the menu. Contrast with the channel picker at the end
-     * of this function, which is partial and draws on top. */
-    if (zone_browser_is_active()) {
-        zone_browser_draw();
-        return;
-    }
-
     /* Frequency entry overlay */
     if (freq_entry_is_active()) {
         display_draw_status_bar();
@@ -397,16 +388,6 @@ void display_update(void)
         break;
     }
 
-    /* Channel picker last, so it lands on top.
-     *
-     * Unlike the menu and frequency-entry overlays above, this one does NOT
-     * return early and replace the screen. It is a partial overlay: the panel
-     * covers the right-hand side while the left keeps showing the channel you
-     * are still tuned to. That is the point of the picker -- you are browsing a
-     * list without having left where you are, so you need to see both at once.
-     *
-     * Self-guards on inactive, so this costs one compare when closed. */
-    channel_picker_draw();
 }
 
 /* ========================================================================
