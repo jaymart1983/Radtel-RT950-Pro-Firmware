@@ -26,12 +26,11 @@
 /* Pin to drive LOW for each column scan iteration.
  * Column 4 drives all low (handled separately). */
 static const uint16_t col_clear[] = {
-    GPIO_PIN_0,                         /* col 0 */
-    GPIO_PIN_1,                         /* col 1 */
-    GPIO_PIN_2,                         /* col 2 */
-    GPIO_PIN_3,                         /* col 3 */
-    GPIO_PIN_0 | GPIO_PIN_1 |           /* col 4 - all low */
-        GPIO_PIN_2 | GPIO_PIN_3
+    GPIO_PIN_0,     /* col 0 */
+    GPIO_PIN_1,     /* col 1 */
+    GPIO_PIN_2,     /* col 2 */
+    GPIO_PIN_3,     /* col 3 */
+    0,              /* col 4 - nothing driven low; see col_set[4] */
 };
 
 /* Pins to drive HIGH for each column (complement within PC0-PC3).
@@ -41,7 +40,18 @@ static const uint16_t col_set[] = {
     GPIO_PIN_0 | GPIO_PIN_2 | GPIO_PIN_3,   /* col 1 */
     GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_3,   /* col 2 */
     GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2,   /* col 3 */
-    0                                        /* col 4 - none high */
+    /* col 4: ALL columns high.
+     *
+     * This drove all four LOW, which is the opposite of what the hardware
+     * wants and matched indiscriminately: with every column low, any pressed
+     * key anywhere pulls its row low, so this state claimed keys belonging to
+     * other columns and reported them under the wrong names.
+     *
+     * Measured behaviour: keys 1, 4, 7 and star register only when PC0-PC3 are
+     * ALL HIGH -- they are not driven by any column. The pinmap says exactly
+     * this in a note, while its matrix table says otherwise; the note is
+     * right. */
+    GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3
 };
 
 /* Row patterns read from GPIOD IDR bits 4-7 (active-low, masked 0xF0).
@@ -57,7 +67,21 @@ static const uint16_t col_set[] = {
  * OEM: delay_short(10) @ 0x08013020, 0x08013056. */
 static void scan_delay(void)
 {
-    volatile uint32_t n = 10;
+    /* Settle time after changing the column drive, before reading the rows.
+     *
+     * This was 10 iterations -- under a microsecond -- and the rows never had
+     * time to respond. The symptom was precise: every key reported the correct
+     * ROW but was always attributed to column PC0, because the read happened
+     * before the newly driven column had taken effect, so each scan iteration
+     * saw the state left by the one before it.
+     *
+     * The rows are inputs with the internal pull-ups (~40k), and those charge
+     * the line slowly against its capacitance. A raw diagnostic using 400
+     * iterations discriminated the columns perfectly, so the requirement is
+     * tens of microseconds, not fractions of one. 400 keeps a healthy margin
+     * and still leaves a full five-column scan far quicker than the 20 ms
+     * keypad tick. */
+    volatile uint32_t n = 400;
     while (n--)
         ;
 }
@@ -67,6 +91,53 @@ static inline uint8_t read_rows(void)
 {
     return (uint8_t)(KBD_ROW_PORT->IDR & KBD_ROW_MASK);
 }
+
+/* Scan position -> key code, MEASURED on hardware.
+ *
+ * This replaces `col * 4 + row`, which assumed the columns were wired in the
+ * order the pinmap's matrix table shows. They are not, and the table is wrong
+ * in every position. Measured by driving each column in turn and reading the
+ * raw row bits while each key was held:
+ *
+ *   PC0 low   -> OK      ABC    Back   V/M      (table claimed 1 4 7 star)
+ *   PC1 low   -> 3       6      9      #        (table claimed 2 5 8 0)
+ *   PC2 low   -> 2       5      8      0        (table claimed 3 6 9 #)
+ *   PC3 low   -> Up      Down   Left   Right    (table claimed OK ABC Back V/M)
+ *   all HIGH  -> 1       4      7      star     (table claimed the arrows)
+ *
+ * Rows are PD7, PD6, PD5, PD4 top to bottom, active low, so row index 0..3
+ * runs top to bottom as decode_row() returns it.
+ *
+ * The pinmap's own note -- "5th column: keys 1,4,7,star read when all PC0-PC3
+ * HIGH" -- turns out to be right, while its table disagrees. The note wins:
+ * those four keys register in every column state, which is what a set of keys
+ * not driven by any column looks like.
+ *
+ * Consequence before this fix: only 1, 4, 7 and star produced any event at all,
+ * because only the all-high state ever matched a key the driver believed in.
+ */
+/* Physical key names, confirmed by pressing each one and reading back what the
+ * driver reported:
+ *
+ *     KEY_C_MENU  = the OK key
+ *     KEY_A_VFO   = the ABC key
+ *     KEY_B_SCAN  = the Back / return key
+ *     KEY_D_BAND  = the V/M key
+ *     KEY_C4R0..3 = Up, Down, Left, Right
+ *
+ * The constant names come from the header's original layout and do not match
+ * this radio's key legends -- KEY_A_VFO is not an "A/VFO" key here, it is ABC.
+ * Renaming them would touch every caller, so the mapping is documented instead.
+ * Any UI code should use these comments, not the constant names, to decide what
+ * a key means.
+ */
+static const uint8_t scan_keymap[5][4] = {
+    /* PC0 low  */ { KEY_C_MENU, KEY_A_VFO,  KEY_B_SCAN, KEY_D_BAND },
+    /* PC1 low  */ { KEY_3,      KEY_6,      KEY_9,      KEY_HASH   },
+    /* PC2 low  */ { KEY_2,      KEY_5,      KEY_8,      KEY_0      },
+    /* PC3 low  */ { KEY_C4R0,   KEY_C4R1,   KEY_C4R2,   KEY_C4R3   },
+    /* all HIGH */ { KEY_1,      KEY_4,      KEY_7,      KEY_STAR   },
+};
 
 /* Decode a row pattern to row index (0-3) or 0xFF if none/multiple. */
 static uint8_t decode_row(uint8_t pattern)
@@ -140,8 +211,21 @@ uint8_t keypad_scan(void)
         return KEY_NONE;
     }
 
-    /* Scan each of 5 columns (OEM loop: r4=0..4 @ 0x08013040-0x0801307A) */
-    for (uint8_t col = 0; col < 5; col++) {
+    /* Scan order: the all-high state (index 4) FIRST, then the driven columns.
+     *
+     * Keys 1, 4, 7 and star are not driven by any column -- they pull their row
+     * low in every scan state, including while PC0 is being driven. Checking
+     * PC0 first therefore claimed them and reported PC0's keys instead:
+     * pressing 1/4/7/star gave C/MENU, A/VFO, B/SCAN, D/BAND, one per row.
+     *
+     * With all columns HIGH, no driven column can be pulling a row low, so a
+     * low row in that state unambiguously means a 5th-column key. Testing it
+     * first removes the ambiguity entirely; the driven columns are then checked
+     * only when it does not match. */
+    static const uint8_t scan_order[5] = { 4, 0, 1, 2, 3 };
+
+    for (uint8_t i = 0; i < 5; i++) {
+        uint8_t col = scan_order[i];
         /* Drive the selected column low, others high.
          * OEM: ldrh col_set[col], gpio_bits_set; ldrh col_clear[col], gpio_bits_reset */
         if (col_set[col])
@@ -159,7 +243,7 @@ uint8_t keypad_scan(void)
 
         /* Restore idle state before returning */
         gpio_set_pin(KBD_COL_PORT, KBD_COL_MASK);
-        return (uint8_t)(col * 4 + row);
+        return scan_keymap[col][row];
     }
 
     /* No key found - restore idle */

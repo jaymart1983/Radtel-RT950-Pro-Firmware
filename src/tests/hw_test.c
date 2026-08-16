@@ -164,6 +164,7 @@ static void dbg_dec(uint32_t v)
  *  Confirms: GPIO output, clock init, SysTick
  * ========================================================================== */
 
+__attribute__((unused))
 static void draw_kv(uint16_t y, const char *label, uint32_t v, uint16_t col)
 {
     char b[32]; uint8_t n = 0;
@@ -172,6 +173,18 @@ static void draw_kv(uint16_t y, const char *label, uint32_t v, uint16_t col)
     if (!v) t[ti++] = '0';
     while (v) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
     while (ti) b[n++] = t[--ti];
+    b[n++] = ' '; b[n++] = ' '; b[n] = '\0';
+    lcd_draw_string(6, y, b, col, 0x0000);
+}
+
+__attribute__((unused))
+static void draw_hex(uint16_t y, const char *label, uint32_t v, uint16_t col)
+{
+    static const char H[] = "0123456789ABCDEF";
+    char b[32]; uint8_t n = 0;
+    while (*label) b[n++] = *label++;
+    b[n++] = H[(v >> 4) & 0xF];
+    b[n++] = H[v & 0xF];
     b[n++] = ' '; b[n++] = ' '; b[n] = '\0';
     lcd_draw_string(6, y, b, col, 0x0000);
 }
@@ -185,67 +198,50 @@ void test_blinky(void)
     lcd_init();
     lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x0000);
 
+    keypad_init();
     encoder_init();
 
-    lcd_draw_string(6,  4, "ENCODER TEST", 0xFFE0, 0x0000);
-    lcd_draw_string(6, 18, "turn the knob", 0x07FF, 0x0000);
+    lcd_draw_string(6,  4, "KEY + KNOB TEST", 0xFFE0, 0x0000);
+    lcd_draw_string(6, 18, "press any key", 0x07FF, 0x0000);
+    dbg_println("KEY+KNOB TEST: driver-level");
 
-    dbg_println("ENCODER TEST: raw pins + fast poll");
+    /* Names indexed by KEY_* code, so the driver's own output can be read
+     * directly instead of decoded by hand. */
+    static const char *names[] = {
+        "1","2","3","A/VFO", "4","5","6","B/SCAN",
+        "7","8","9","C/MENU", "*","0","#","D/BAND",
+        "UP","DOWN","LEFT","RIGHT", "SIDE1","SIDE4"
+    };
 
-    /* Poll as fast as the loop allows.
-     *
-     * The previous attempt polled every 30 ms and saw nothing. The real
-     * firmware polls this encoder every 5 ms, and the driver's debounce resets
-     * its counter on every change -- so at 30 ms a detent's transitions are
-     * missed entirely and it can never register. Polling flat out removes that
-     * as an explanation.
-     *
-     * The raw A/B levels are shown separately, straight from IDR. If those
-     * never move while the knob turns, the pins are not reaching the CPU at all
-     * -- PB4 is JTAG NJTRST unless the SWD remap freed it -- and no amount of
-     * polling will help. That is the distinction this test exists to make. */
-    uint32_t det = 0, cw = 0, ccw = 0, edges = 0;
-    int32_t  pos = 0;
-    uint8_t  prev_raw = 0xFF;
-    uint32_t frame = 0;
+    uint32_t keys = 0, det = 0;
+    int32_t pos = 0;
 
     while (1) {
-        uint32_t idr = ((GPIO_TypeDef *)GPIOB_BASE)->IDR;
-        uint8_t a = (idr >> 4) & 1u;          /* PB4 = channel A */
-        uint8_t b = (idr >> 5) & 1u;          /* PB5 = channel B */
-        uint8_t raw = (uint8_t)((a << 1) | b);
-        if (raw != prev_raw) { edges++; prev_raw = raw; }
-
         int8_t d = encoder_poll();
         if (d) {
             det++;
-            if (d > 0) { cw++; pos++; } else { ccw++; pos--; }
-            dbg_puts("[ENC] ");
-            dbg_puts(d > 0 ? "CW" : "CCW");
-            dbg_newline();
-        }
-
-        /* Refresh the screen only occasionally -- drawing is slow and would
-         * otherwise become the thing limiting the poll rate. */
-        /* Heartbeat. Without one, a test that only prints on events is
-         * indistinguishable from a hung radio -- which has already wasted time
-         * twice in this project. */
-        if ((frame % 20000u) == 0u) {
-            dbg_puts("hb det=");
-            dbg_dec(det);
-            dbg_newline();
-        }
-
-        if ((frame++ % 400u) == 0u) {
-            draw_kv(40,  "A level:  ", a,     a ? 0x07E0 : 0xF800);
-            draw_kv(54,  "B level:  ", b,     b ? 0x07E0 : 0xF800);
-            draw_kv(68,  "raw edges:", edges, 0xFFFF);
-            draw_kv(90,  "detents:  ", det,   0xFFFF);
-            draw_kv(104, "  CW:     ", cw,    0x07E0);
-            draw_kv(118, "  CCW:    ", ccw,   0x07E0);
-            draw_kv(132, "position: ", (uint32_t)(pos < 0 ? -pos : pos),
+            pos += (d > 0) ? 1 : -1;
+            draw_kv(100, "detents:  ", det, 0xFFFF);
+            draw_kv(114, "position: ", (uint32_t)(pos < 0 ? -pos : pos),
                     pos < 0 ? 0xF800 : 0x07E0);
         }
+
+        key_event_t ev;
+        if (keypad_get_event(&ev)) {
+            if (ev.type == KEY_EVT_PRESS) {
+                keys++;
+                const char *nm = (ev.key < 22) ? names[ev.key] : "?";
+                lcd_fill_rect(1, 44, LCD_WIDTH - 2, 30, 0x0000);
+                lcd_draw_string_2x(6, 46, nm, 0xFFE0, 0x0000);
+                draw_kv(80, "presses:  ", keys, 0xFFFF);
+                dbg_puts("[KEY] ");
+                dbg_puts(nm);
+                dbg_puts(" code=");
+                dbg_dec(ev.key);
+                dbg_newline();
+            }
+        }
+        delay_ms(5);
     }
 }
 
