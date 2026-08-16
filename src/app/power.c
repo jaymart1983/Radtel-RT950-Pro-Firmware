@@ -394,46 +394,78 @@ void power_off(void)
      * core is in WFI most of the time, and this state is only ever reached if
      * the hardware failed to cut power -- in which case something is drawing
      * current regardless. */
-    /* Shed everything we can before idling.
+    /* Sleep properly: STOP mode, woken by the switch itself.
      *
-     * The rail does not collapse when PB9 is released -- proved by the fact
-     * that this code keeps executing -- and PA11, which the pinmap labels
-     * "DEVICE POWER OFF", does nothing on either polarity. So a true hardware
-     * cut has not been found, and "off" means "idle as quietly as possible".
+     * PE0 sits on EXTI line 0, so the power switch can be an interrupt source
+     * rather than something to poll. That matters: the previous version woke
+     * twice a second to read a pin that had not changed, and before that it
+     * spun on a volatile counter at 120 MHz. In STOP mode every clock is halted
+     * -- core, PLL, HSE, all peripherals -- and the part draws microamps until
+     * the pin moves. Nothing is checked periodically because nothing needs to
+     * be; the hardware does the waiting.
      *
-     * Killing the peripheral clocks is most of the win: the LCD controller,
-     * SPI, timers, ADC, DMA and the spare UARTs all stop drawing. GPIOE stays
-     * clocked because PE0 must remain readable to notice the switch, and GPIOB
-     * because PB9 is still driven. The core itself spends nearly all its time
-     * halted in WFI below.
-     *
-     * This is a mitigation, not a fix. A genuine power cut would be better and
-     * is still worth finding. */
+     * Set up in this order deliberately: EXTI first, while the IOMUX clock is
+     * still on, then shed the rest.
+     */
+
+    /* IOMUX (AFIO) clock, needed to route EXTI0 to port E. */
+    CRM->APB2EN |= (1UL << 0);
+
+    /* EXTI0 <- PE0. EXTICR[0] bits [3:0]: 0=PA, 1=PB, 2=PC, 3=PD, 4=PE. */
+    AFIO->EXTICR[0] = (AFIO->EXTICR[0] & ~0xFUL) | 0x4UL;
+
+    /* Trigger on the falling edge: PE0 is HIGH with the switch OFF and goes LOW
+     * when it is turned back ON. Unmask the line and clear anything stale. */
+    /* EXTI registers: IMR +0x00, RTSR +0x08, FTSR +0x0C, PR +0x14. */
+    *(volatile uint32_t *)(EXTI_BASE + 0x0CUL) |=  (1UL << 0);   /* FTSR */
+    *(volatile uint32_t *)(EXTI_BASE + 0x08UL) &= ~(1UL << 0);   /* RTSR */
+    *(volatile uint32_t *)(EXTI_BASE + 0x14UL)  =  (1UL << 0);   /* PR   */
+    *(volatile uint32_t *)(EXTI_BASE + 0x00UL) |=  (1UL << 0);   /* IMR  */
+
+    /* Enable EXTI0 in the NVIC so it can wake us. The handler never runs --
+     * interrupts are masked -- but a pending interrupt is what ends WFI. */
+    *(volatile uint32_t *)(0xE000E280UL + (EXTI0_IRQn / 32) * 4UL)
+        = (1UL << (EXTI0_IRQn % 32));                     /* ICPR: clear */
+    *(volatile uint32_t *)(0xE000E100UL + (EXTI0_IRQn / 32) * 4UL)
+        = (1UL << (EXTI0_IRQn % 32));                     /* ISER: enable */
+
+    /* Now drop everything else. GPIOE keeps its clock so PE0 still drives the
+     * EXTI input; IOMUX keeps its routing. */
     CRM->APB1EN = 0;
-    CRM->APB2EN = (1UL << 3) | (1UL << 6);   /* IOPBEN | IOPEEN only */
+    CRM->APB2EN = (1UL << 0) | (1UL << 3) | (1UL << 6);   /* IOMUX | IOPB | IOPE */
     CRM->AHBEN  = 0;
 
-    for (;;) {
-        for (volatile uint32_t i = 0; i < 200000UL; i++)
-            ;
+    /* SysTick off -- a periodic tick would defeat the whole point. */
+    SysTick->CTRL = 0;
 
+    /* PWC: STOP mode with the regulator in low-power state.
+     *   bit0 LPSEL  1 = regulator low-power while stopped
+     *   bit1 PDDS   0 = STOP (not STANDBY -- STANDBY loses SRAM and we want a
+     *                  clean reset path, not a cold boot with no state)
+     * SCB->SCR bit2 SLEEPDEEP selects deep sleep for WFI. */
+    CRM->APB1EN |= (1UL << 28);                           /* PWC clock */
+    {
+        volatile uint32_t *pwc_ctrl = (volatile uint32_t *)0x40007000UL;
+        *pwc_ctrl = (*pwc_ctrl & ~(1UL << 1)) | (1UL << 0);
+    }
+    SCB->SCR |= (1UL << 2);                               /* SLEEPDEEP */
+
+    for (;;) {
+        __WFI();                    /* STOP: clocks halted until PE0 falls */
+
+        /* Woken. Only the switch can have done it, so boot. Waking from STOP
+         * leaves the clock tree on HSI, which the reset sorts out. */
         if (!(PWR_SWITCH_PORT->IDR & PWR_SWITCH_PIN)) {
-            /* Switch back ON -- reboot into the application. */
+            SCB->SCR &= ~(1UL << 2);
             __DSB();
             SCB->AIRCR = SCB_AIRCR_VECTKEY | SCB_AIRCR_SYSRESETREQ;
             __DSB();
         }
 
-        __WFI();
+        /* Spurious wake: clear and go back to sleep. */
+        *(volatile uint32_t *)(EXTI_BASE + 0x14UL) = (1UL << 0);
     }
 }
-
-/* ========================================================================
- *  power_reset - MCU reset via NVIC SYSRESETREQ.
- *
- *  Use for error recovery when a full hardware power cycle isn't needed.
- *  After reset the bootloader runs and re-enters firmware normally.
- * ======================================================================== */
 
 void power_reset(void)
 {
