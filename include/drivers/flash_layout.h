@@ -1,7 +1,21 @@
 /*
  * flash_layout.h - SPI flash memory map for RT-950 Pro
  *
- * External NOR flash: Winbond W25Q16 (2 MB / 16 Mbit)
+ * External NOR flash: NOT a Winbond W25Q16, despite what this file used to say.
+ *
+ * Measured JEDEC ID on a physical radio: 5E 40 16.
+ *   0x5E  manufacturer -- NOT Winbond (0xEF)
+ *   0x16  capacity     -- JEDEC encodes this as a power of two, so 2^22 = 4 MB.
+ *                         A W25Q16 would report 0x15 (2 MB).
+ *
+ * Confirmed non-destructively rather than trusting the ID: a 2 MB part ignores
+ * the top address bit, so 0x200000 would alias back to 0x000000. It does not --
+ * 0x000000 holds the channel table ("GMRS 1") while 0x200000 holds entirely
+ * different, non-erased data. The part is at least 4 MB.
+ *
+ * NOTE: something already occupies 0x200000, above the region this header
+ * describes. Nothing in this firmware writes there. Worth identifying before
+ * anything starts using the space.
  * Interface: SPI2 (PB12=CS, PB13=SCK, PB14=MISO, PB15=MOSI)
  *
  * Layout verified against V0.27 firmware + KDH server config JSON.
@@ -19,7 +33,10 @@
 #include <stdint.h>
 
 /* Flash geometry ---------------------------------------------------- */
-#define FLASH_TOTAL_SIZE        0x200000    /* 2 MB */
+#define FLASH_TOTAL_SIZE        0x400000    /* 4 MB -- see the header note.
+                                             * Was 0x200000, based on a
+                                             * W25Q16 that is not the fitted
+                                             * part. */
 #define FLASH_PAGE_SIZE         256         /* Bytes per write page */
 #define FLASH_SECTOR_SIZE       4096        /* 4 KB erase sector */
 #define FLASH_BLOCK_SIZE_32K    (32 * 1024)

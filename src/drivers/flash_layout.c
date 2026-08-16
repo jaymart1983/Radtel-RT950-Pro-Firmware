@@ -4,7 +4,8 @@
  * Provides channel read/write, calibration, and settings access
  * on top of the low-level SPI flash driver (spi.h).
  *
- * Flash chip: Winbond W25Q16 (2 MB)
+ * Flash chip: JEDEC 5E 40 16 on the measured radio -- 4 MB, not the
+ * Winbond W25Q16 (2 MB) previously assumed. See flash_layout.h.
  * Channel memory: 990 channels x 32 bytes at 0x000000
  *   V0.27 channel write @ 0x0800EFB0 (read-modify-write 4KB sector)
  *   V0.27 channel read  @ 0x0800FA58 (addr = ch * 32 via lsl 5)

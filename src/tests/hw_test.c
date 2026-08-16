@@ -179,6 +179,7 @@ static void dbg_dec(uint32_t v)
  * characters behind -- "100" becoming "99" leaves the trailing 0. Padding to a
  * fixed width overwrites them instead, which costs nothing and flickers not at
  * all. */
+__attribute__((unused))
 static void draw_field(uint16_t y, const char *label, uint32_t v, uint16_t col)
 {
     char b[32]; uint8_t n = 0;
@@ -222,116 +223,52 @@ static void draw_hex(uint16_t y, const char *label, uint32_t v, uint16_t col)
 void test_blinky(void)
 {
     test_debug_init();
+    dbg_println("=== FLASH SIZE / ID TEST ===");
 
-    gpio_config_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
+    /* Is this really a 2 MB W25Q16?
+     *
+     * flash_layout.h says Winbond W25Q16, 2 MB. But the JEDEC ID reads
+     * 5E 40 16, and Winbond's manufacturer code is EF. The capacity byte is
+     * also wrong for that part: JEDEC encodes it as a power of two, so 0x15
+     * is 2 MB and 0x16 is 4 MB.
+     *
+     * A 2 MB chip ignores the top address bit, so address 0x200000 aliases
+     * back to 0x000000. A 4 MB chip does not. Writing nothing and simply
+     * comparing the two regions settles it non-destructively: channel 0 holds
+     * "GMRS 1", which is highly distinctive, so if 0x200000 returns the same
+     * bytes the part is 2 MB and wrapping. */
+    uint8_t lo[32], hi[32];
+    spi_flash_read(0x000000UL, lo, 32);
+    spi_flash_read(0x200000UL, hi, 32);
 
-    gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
-    lcd_init();
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x0000);
+    dbg_puts("JEDEC = "); dbg_hex8((uint8_t)(spi_flash_read_id() >> 16));
+    dbg_puts(" ");        dbg_hex8((uint8_t)(spi_flash_read_id() >> 8));
+    dbg_puts(" ");        dbg_hex8((uint8_t)spi_flash_read_id());
+    dbg_newline();
 
-    keypad_init();
-    encoder_init();
-    audio_init();
+    dbg_puts("0x000000:");
+    for (uint8_t i = 0; i < 16; i++) { dbg_puts(" "); dbg_hex8(lo[i]); }
+    dbg_newline();
+    dbg_puts("0x200000:");
+    for (uint8_t i = 0; i < 16; i++) { dbg_puts(" "); dbg_hex8(hi[i]); }
+    dbg_newline();
 
-    /* Audio hardware, in hw_init()'s order. HW_TEST skips hw_init(), so every
-     * one of these has to be done by hand -- and each was missing at some
-     * point, each on its own enough to produce silence. */
-    dac_audio_init();                     /* DAC + TIM6 + DMA2 clocks */
+    uint8_t same = 1;
+    for (uint8_t i = 0; i < 32; i++)
+        if (lo[i] != hi[i]) { same = 0; break; }
 
-    bk4829_audio_filter_config(BK4829_CHIP0);
-    bk4829_audio_filter_config(BK4829_CHIP1);
-    bk4829_set_af_beep(BK4829_CHIP0);      /* REG47: DAC -> speaker driver */
-    bk4829_set_af_beep(BK4829_CHIP1);
+    dbg_println(same ? "SAME -> 2 MB part, address wraps"
+                     : "DIFFERENT -> larger than 2 MB");
 
-    gpio_config_pin(GPIOE, GPIO_PIN_7, GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
-    gpio_set_pin(GPIOE, GPIO_PIN_7);      /* U3T_EN: RX / speaker */
-    gpio_config_pin(GPIOE, GPIO_PIN_9, GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(GPIOE, GPIO_PIN_9);    /* SW_TO_BT low: speaker not BT */
-    gpio_config_pin(SPK_MUTE_PORT, SPK_MUTE_PIN, GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(SPK_MUTE_PORT, SPK_MUTE_PIN);   /* unmute */
-    gpio_config_pin(GPIOE, GPIO_PIN_4, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(GPIOE, GPIO_PIN_4);      /* AMP_PWR: amplifier rail */
-    gpio_config_pin(AMP_EN_PORT, AMP_EN_PIN, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(AMP_EN_PORT, AMP_EN_PIN);
-    /* PC12 selects which source reaches the speaker:
-     *   HIGH = radio / BK4829 audio
-     *   LOW  = DAC beep path        <- what a generated tone needs
-     * main.c documents this as "V12 verified". It was being set HIGH here,
-     * which routes the speaker to the receiver's audio instead of the DAC --
-     * so a perfectly good DAC waveform went nowhere. The full chain measured
-     * healthy (TIM6 counting, DMA transferring, DAC DOR changing) while the
-     * output was simply switched away from it. */
-    gpio_config_pin(GPIOC, GPIO_PIN_12, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(GPIOC, GPIO_PIN_12);   /* DAC beep path */
+    /* Probe further out too, in case it is larger still. */
+    uint8_t q[16];
+    spi_flash_read(0x300000UL, q, 16);
+    dbg_puts("0x300000:");
+    for (uint8_t i = 0; i < 16; i++) { dbg_puts(" "); dbg_hex8(q[i]); }
+    dbg_newline();
 
-    lcd_draw_string(6,  4, "AUDIO TEST", 0xFFE0, 0x0000);
-    lcd_draw_string(6, 18, "1=tone ON  3=tone OFF", 0x07FF, 0x0000);
-    dbg_println("AUDIO TEST");
-    dbg_puts("REG47="); dbg_hex16(bk4829_read_reg(BK4829_CHIP0, 0x47)); dbg_newline();
-
-    uint8_t vol = 60, prev_vol = 0xFF;
-    dac_audio_set_volume(vol);
-
-    uint32_t frame = 0;
-    /* 5 ms loop, same shape as the keypad test that worked. The previous
-     * version spent ~80 ms per iteration polling the encoder in a tight inner
-     * loop, which starved the keypad's debounce state machine -- it needs to be
-     * called regularly, and stopped registering presses entirely. */
-    while (1) {
-        int8_t d = encoder_poll();
-        if (d) {
-            int16_t v = (int16_t)vol + (d > 0 ? 5 : -5);
-            vol = (uint8_t)(v < 0 ? 0 : (v > 100 ? 100 : v));
-            dac_audio_set_volume(vol);
-        }
-
-        key_event_t ev;
-        if (keypad_get_event(&ev) && ev.type == KEY_EVT_PRESS) {
-            dbg_puts("[KEY] code="); dbg_dec(ev.key); dbg_newline();
-
-            if (ev.key == KEY_1) {
-                dac_audio_play_tone(10000);
-                dbg_println("[AUD] tone ON");
-                {
-                    volatile uint32_t *t6cr1  = (volatile uint32_t *)0x40001000UL;
-                    volatile uint32_t *t6cnt  = (volatile uint32_t *)0x40001024UL;
-                    volatile uint32_t *d3ccr  = (volatile uint32_t *)0x40020430UL;
-                    volatile uint32_t *d3ndtr = (volatile uint32_t *)0x40020434UL;
-                    volatile uint32_t *daccr  = (volatile uint32_t *)0x40007400UL;
-                    volatile uint32_t *dacdor = (volatile uint32_t *)0x4000742CUL;
-                    uint32_t c1=*t6cnt, n1=*d3ndtr, o1=*dacdor;
-                    for (volatile uint32_t w=0; w<20000; w++) ;
-                    dbg_puts("[AUD] T6CR1="); dbg_hex16((uint16_t)*t6cr1);
-                    dbg_puts(" CNT=");  dbg_hex16((uint16_t)c1);
-                    dbg_puts("->");     dbg_hex16((uint16_t)*t6cnt);
-                    dbg_puts(" DMACCR="); dbg_hex16((uint16_t)*d3ccr);
-                    dbg_puts(" NDTR=");   dbg_hex16((uint16_t)n1);
-                    dbg_puts("->");       dbg_hex16((uint16_t)*d3ndtr);
-                    dbg_puts(" DACCR=");  dbg_hex16((uint16_t)*daccr);
-                    dbg_puts(" DOR=");    dbg_hex16((uint16_t)o1);
-                    dbg_puts("->");       dbg_hex16((uint16_t)*dacdor);
-                    dbg_newline();
-                }
-            } else if (ev.key == KEY_3) {
-                dac_audio_stop();
-                dbg_println("[AUD] tone OFF");
-            }
-        }
-
-        if (vol != prev_vol) {
-            prev_vol = vol;
-            draw_field(60, "volume %: ", vol, 0x07E0);
-        }
-
-        if ((frame % 200u) == 0u) {
-            dbg_puts("hb "); dbg_dec(frame / 200u); dbg_newline();
-        }
-        frame++;
-        delay_ms(5);
-    }
+    uint32_t hb = 0;
+    while (1) { dbg_puts("hb "); dbg_dec(hb++); dbg_newline(); delay_ms(2000); }
 }
 
 /* ==========================================================================

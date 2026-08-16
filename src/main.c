@@ -87,9 +87,6 @@ extern uint32_t get_tick(void);
 
 calibration_t cal_data;
 extern void delay_ms(uint32_t ms);
-#ifndef IWDG_FEED
-#define IWDG_FEED()  (*(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL)
-#endif
 
 void hw_init(void)
 {
@@ -112,18 +109,29 @@ void hw_init(void)
     spi2_init();
     IWDG_FEED();
 
-    /* Verify flash chip: expect W25Q16 (Winbond 0xEF, 16Mbit 0x4015)
-     * OEM: periph_init_flash_adc @ 0x08013820 reads JEDEC after SPI2 init.
-     * Valid IDs: 0xEF4015 (W25Q16BV), 0xEF4016 (W25Q32). */
+    /* Identify the flash chip.
+     *
+     * This expected a Winbond W25Q16 (0xEF4015) and warned about anything else.
+     * The fitted part on a physical RT-950 Pro reads 5E 40 16: a different
+     * manufacturer entirely, and capacity byte 0x16 = 2^22 = 4 MB, twice what
+     * was assumed. Verified non-destructively -- 0x200000 does not alias back
+     * to 0x000000, so the address space really is larger than 2 MB.
+     *
+     * Accept anything that answers with a sane capacity rather than insisting
+     * on one vendor; the size is what actually matters to the layout. */
     {
         uint32_t jedec = spi_flash_read_id();
         dbg_reg("[DBG] SPI JEDEC=0x", jedec);
-        if ((jedec & 0xFFFF00) == 0xEF4000)
-            dbg_puts("[DBG] Flash: Winbond W25Q detected OK\n");
-        else if (jedec == 0x000000 || jedec == 0xFFFFFF)
+        uint8_t cap = (uint8_t)(jedec & 0xFF);
+        if (jedec == 0x000000 || jedec == 0xFFFFFF) {
             dbg_puts("[ERR] Flash: no response (check SPI2 wiring)\n");
-        else
-            dbg_puts("[WARN] Flash: unexpected JEDEC ID\n");
+        } else if (cap >= 0x14 && cap <= 0x18) {
+            dbg_puts("[DBG] Flash OK, size = 2^");
+            dbg_reg("", cap);
+            dbg_puts(" bytes\n");
+        } else {
+            dbg_puts("[WARN] Flash: unrecognised capacity byte\n");
+        }
     }
 
     /* Flash read sanity: dump first 16B of channel memory (0x0000)
