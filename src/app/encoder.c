@@ -36,7 +36,19 @@ static const int8_t quad_table[16] = {
 #define ENC_DEBOUNCE_THRESHOLD  2   /* consecutive identical reads required */
 
 static uint8_t prev_state;          /* last accepted 2-bit Gray state */
-static int8_t  accum;              /* accumulated quarter-steps */
+/* Quadrature steps per mechanical detent.
+ *
+ * Measured on the RT-950 Pro: turning the knob one click produces TWO state
+ * transitions, not four. Emitting a detent every 4 steps therefore reported one
+ * detent per two clicks -- confirmed on hardware, where ten clicks gave five
+ * detents while the raw A/B levels alternated cleanly once per click.
+ *
+ * This is a half-step encoder. Full-quadrature parts give four transitions per
+ * detent and would need 4 here, so it is a named constant rather than a magic
+ * number: it is a property of the part, not of the algorithm. */
+#define ENC_STEPS_PER_DETENT    2
+
+static int8_t  accum;              /* accumulated quadrature steps */
 static uint8_t debounce_count;     /* consecutive identical raw reads */
 static uint8_t debounce_state;     /* state being debounced */
 
@@ -90,11 +102,11 @@ int8_t encoder_poll(void)
 
     /* Accumulate quarter-steps; emit detent on every 4th step */
     accum += dir;
-    if (accum >= 4) {
+    if (accum >= ENC_STEPS_PER_DETENT) {
         accum = 0;
         return +1;  /* CW detent */
     }
-    if (accum <= -4) {
+    if (accum <= -ENC_STEPS_PER_DETENT) {
         accum = 0;
         return -1;  /* CCW detent */
     }
