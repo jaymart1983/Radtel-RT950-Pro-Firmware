@@ -21,70 +21,7 @@
  * See include/tests/hw_test.h for test list.
  */
 
-#ifdef HW_TEST
-#include "tests/hw_test.h"
-#include "app/update_listener.h"
-
-int main(void)
-{
-    /* PB9 POWER LATCH FIRST -- before anything else whatsoever.
-     *
-     * The power/volume knob only applies power momentarily; the firmware has to
-     * grab this latch within milliseconds or the radio dies before it finishes
-     * booting. The normal main() does this as its first action for exactly that
-     * reason, but the HW_TEST main() did not, so a test build could power off
-     * cleanly and then refuse to power back on -- the knob would apply power,
-     * the firmware would still be initialising, and it would drop dead again.
-     * Recovering needed a battery pull.
-     *
-     * Bare register writes, not gpio_config_pin(), so this happens before any
-     * driver is touched: GPIOB clock on, PB9 as 2 MHz push-pull output, set. */
-    {
-        volatile uint32_t *apb2en = (volatile uint32_t *)0x40021018UL;
-        *apb2en |= (1UL << 3);                       /* IOPBEN */
-        volatile uint32_t *crh = (volatile uint32_t *)(0x40010C00UL + 0x04UL);
-        uint32_t v = *crh;
-        v &= ~(0xFUL << 4);                          /* PB9 = CRH bits [7:4] */
-        v |=  (0x2UL << 4);                          /* mode 10 (2 MHz), cnf 00 */
-        *crh = v;
-        *(volatile uint32_t *)(0x40010C00UL + 0x10UL) = (1UL << 9);  /* SCR: PB9 high */
-    }
-
-    /* Arm the soft update listener in the hardware tests too. Without it, every
-     * rung of the bring-up ladder would need the side-button + battery-pull
-     * dance to move to the next one, which is most of the cost of testing. */
-    update_listener_init();
-
-#if   HW_TEST == 1
-    test_blinky();
-#elif HW_TEST == 2
-    test_uart_echo();
-#elif HW_TEST == 3
-    test_lcd_pattern();
-#elif HW_TEST == 4
-    test_bk4829_id();
-#elif HW_TEST == 5
-    test_si4732_rev();
-#elif HW_TEST == 6
-    test_spi_flash_id();
-#elif HW_TEST == 7
-    test_adc_monitor();
-#elif HW_TEST == 8
-    test_dac_tone();
-#elif HW_TEST == 9
-    test_keypad_encoder();
-#elif HW_TEST == 10
-    test_gps_display();
-#elif HW_TEST == 11
-    test_full_diagnostic();
-#else
-#error "Unknown HW_TEST value (valid: 1-11)"
-#endif
-    return 0;
-}
-
-#else /* Normal firmware build */
-
+/* Shared by both build flavours -- see the note on hw_init below. */
 #include "at32f403a.h"
 #include "rt950_pinmap.h"
 #include "debug_uart.h"
@@ -128,7 +65,354 @@ int main(void)
 #include "kernel/scheduler.h"
 #include "kernel/event.h"
 
+extern uint32_t get_tick(void);
+#ifndef IWDG_FEED
+#define IWDG_FEED()  (*(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL)
+#endif
+
+/* ========================================================================
+ *  hw_init lives out here, ahead of the HW_TEST split, so the hardware tests
+ *  call the SAME bring-up the production firmware does.
+ *
+ *  It used to sit inside the normal-firmware branch, invisible to HW_TEST
+ *  builds along with every driver header. Each test therefore hand-copied
+ *  fragments of initialisation and kept missing pieces: the encoder, the power
+ *  button and the entire audio path each looked broken purely because their
+ *  setup never ran. Audio alone cost five separate omissions -- DAC clocks
+ *  never enabled, the amplifier rail unpowered, pins driven while still
+ *  configured as inputs, the speaker routed to the receiver instead of the DAC.
+ *
+ *  Sharing the real init makes that whole class of false failure impossible.
+ * ======================================================================== */
+
+calibration_t cal_data;
 extern void delay_ms(uint32_t ms);
+#ifndef IWDG_FEED
+#define IWDG_FEED()  (*(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL)
+#endif
+
+void hw_init(void)
+{
+    /* POWER LATCH: PB9 must be held HIGH to keep the radio powered.
+     * The bootloader asserts this briefly; our firmware must take over
+     * immediately or the radio will power off. */
+    gpio_config_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
+
+    IWDG_FEED();
+
+    /* DMA (must be before LCD and DAC) -------------------------------- */
+    dbg_puts("[DBG] dma_init...\n");
+    dma_init();
+    IWDG_FEED();
+
+    /* SPI flash (SPI2) ----------------------------------------------- */
+    dbg_puts("[DBG] spi2_init...\n");
+    spi2_init();
+    IWDG_FEED();
+
+    /* Verify flash chip: expect W25Q16 (Winbond 0xEF, 16Mbit 0x4015)
+     * OEM: periph_init_flash_adc @ 0x08013820 reads JEDEC after SPI2 init.
+     * Valid IDs: 0xEF4015 (W25Q16BV), 0xEF4016 (W25Q32). */
+    {
+        uint32_t jedec = spi_flash_read_id();
+        dbg_reg("[DBG] SPI JEDEC=0x", jedec);
+        if ((jedec & 0xFFFF00) == 0xEF4000)
+            dbg_puts("[DBG] Flash: Winbond W25Q detected OK\n");
+        else if (jedec == 0x000000 || jedec == 0xFFFFFF)
+            dbg_puts("[ERR] Flash: no response (check SPI2 wiring)\n");
+        else
+            dbg_puts("[WARN] Flash: unexpected JEDEC ID\n");
+    }
+
+    /* Flash read sanity: dump first 16B of channel memory (0x0000)
+     * and calibration validity flag (0xF0E0).
+     * OEM: flash_data_load @ 0x08007358 reads these sectors. */
+    {
+        uint8_t sample[16];
+        uint8_t all_ff = 1;
+        spi_flash_read(0x000000, sample, 16);
+        dbg_puts("[DBG] Flash[0x0000]: ");
+        for (int i = 0; i < 16; i++) {
+            dbg_hex8(sample[i]);
+            dbg_puts(" ");
+            if (sample[i] != 0xFF) all_ff = 0;
+        }
+        dbg_puts("\n");
+        if (all_ff)
+            dbg_puts("[WARN] Flash channel sector appears blank\n");
+
+        uint8_t cal_flag;
+        spi_flash_read(0x00F0E0, &cal_flag, 1);
+        dbg_reg("[DBG] Cal flag @ 0xF0E0 = 0x", cal_flag);
+        if (cal_flag == 0xFF)
+            dbg_puts("[WARN] No calibration data programmed\n");
+        else
+            dbg_puts("[DBG] Calibration data present\n");
+    }
+
+    /* Calibration + wear-leveling (needs SPI flash) ------------------
+     * OEM: hw_init_main calls calibration_load then initializes all 5
+     * WL sectors. Bitmap scan @ 0x0800EF68, SYSCFG write @ 0x0800F918. */
+    dbg_puts("[DBG] calibration+wl...\n");
+    wl_init(&WL_SYSCFG);
+    wl_init(&WL_VFOCFG);
+    wl_init(&WL_EXTCFG);
+    wl_init(&WL_VFOSEL);
+    wl_init(&WL_CHCFG);
+
+    /* Probe each WL sector: attempt a read to check valid/empty/corrupt.
+     * OEM validates sectors on boot before dispatching main task loop.
+     * Buffer must be large enough for the LARGEST record (EXTCFG = 160B). */
+    {
+        uint8_t probe[160];
+        const char *names[] = {"SYSCFG","VFOCFG","EXTCFG","VFOSEL","CHCFG "};
+        (void)names;
+        const wl_sector_t *secs[] = {&WL_SYSCFG,&WL_VFOCFG,&WL_EXTCFG,&WL_VFOSEL,&WL_CHCFG};
+        for (int i = 0; i < 5; i++) {
+            int rc = wl_read(secs[i], probe);
+            (void)rc;
+            dbg_puts("[DBG] WL ");
+            dbg_puts(names[i]);
+            dbg_puts(rc == 0 ? ": valid\n" : ": empty/uninitialized\n");
+        }
+    }
+    IWDG_FEED();
+
+    /* BK4829 dual RF transceivers (GPIOE bit-bang) ------------------- */
+    /* Configure BK4829 SPI GPIO pins as outputs before init.
+     * OEM gpio_modes_init @ 0x0801391C: configures PE8/10/11/15 as
+     * push-pull outputs and resets them LOW (CS idle = HIGH after init). */
+    dbg_puts("[DBG] bk4829_gpio_init...\n");
+    gpio_config_pin(BK4829_SEN1_PORT, BK4829_SEN1_PIN,
+                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE8 = SEN1 */
+    gpio_set_pin(BK4829_SEN1_PORT, BK4829_SEN1_PIN);       /* CS idle HIGH */
+    gpio_config_pin(BK4829_SEN2_PORT, BK4829_SEN2_PIN,
+                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE15 = SEN2 */
+    gpio_set_pin(BK4829_SEN2_PORT, BK4829_SEN2_PIN);       /* CS idle HIGH */
+    gpio_config_pin(BK4829_SCK_PORT, BK4829_SCK_PIN,
+                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE10 = SCK */
+    gpio_clear_pin(BK4829_SCK_PORT, BK4829_SCK_PIN);       /* SCK idle LOW */
+    gpio_config_pin(BK4829_SDA_PORT, BK4829_SDA_PIN,
+                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE11 = SDA */
+
+    /* BK4829 full init + frequency programming happens in
+     * radio_init() → vfo_init() during app_init phase.
+     * Removed from here to avoid double-init HardFault. */
+    dbg_puts("[DBG] bk4829 GPIO ready (init deferred to vfo_init)\n");
+    IWDG_FEED();
+
+    /* SI4732 broadcast receiver (GPIOB bit-bang I2C) ----------------- */
+    dbg_puts("[DBG] si4732_init SKIPPED (radio disabled)\n");
+    IWDG_FEED();
+
+    /* UARTs ---------------------------------------------------------- */
+    dbg_puts("[DBG] uart_bt_init...\n");
+    bt_init();              /* USART1 @ 115200 - Bluetooth + AT config */
+    IWDG_FEED();
+    dbg_puts("[DBG] uart_gps_init...\n");
+    uart_gps_init();        /* USART3 @ 9600 - GPS (PB10/PB11) */
+    IWDG_FEED();
+
+    /* ADC (battery + audio level) ------------------------------------ */
+    dbg_puts("[DBG] adc_init...\n");
+    adc_init();
+    IWDG_FEED();
+
+    /* DAC + TIM6 (CTCSS/AFSK tone generation) ----------------------- */
+    dbg_puts("[DBG] dac_audio_init...\n");
+    dac_audio_init();
+    IWDG_FEED();
+
+    /* Audio routing GPIO init (OEM gpio_modes_init @ 0x0801391C).
+     * OEM configures ALL audio path pins in gpio_modes_init:
+     *   PE7  (U3T_EN)  = GP push-pull output - ACTIVE LOW relay
+     *                     HIGH = RX/speaker (deasserted), LOW = TX/mic
+     *   PE9  (SW_TO_BT) = GP push-pull output, LOW → speaker (not BT)
+     *   PE1  (SPK_MUTE) = GP push-pull output, LOW → unmuted
+     *   PC12 (BEEP_SW)  = GP push-pull output, LOW at boot (enabled per-beep)
+     *   PB8  (AMP_EN)   = GP push-pull output, LOW at boot (enabled per-beep)
+     *
+     * OEM boot state: PB8=LOW, PC12=LOW - both enabled only during beep_play.
+     * PE7=HIGH (RX mode), PE9=LOW (speaker not BT), PE1=LOW (unmuted). */
+    dbg_puts("[DBG] spk_unmute+beep_sw...\n");
+    /* PE7 = U3T_EN: HIGH = RX/speaker mode (relay deasserted, ACTIVE LOW) */
+    gpio_config_pin(GPIOE, GPIO_PIN_7,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIOE, GPIO_PIN_7);                /* RX audio mode */
+    /* PE9 = SW_TO_BT: LOW = speaker path (not Bluetooth) */
+    gpio_config_pin(GPIOE, GPIO_PIN_9,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOE, GPIO_PIN_9);              /* speaker mode */
+    /* PE1 = SPK_MUTE: LOW = unmuted */
+    gpio_config_pin(SPK_MUTE_PORT, SPK_MUTE_PIN,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(SPK_MUTE_PORT, SPK_MUTE_PIN);   /* unmute speaker */
+    /* PE4 = AMP_PWR: powers the audio amplifier rail (V12 discovery).
+     * Must be HIGH for any audio output. */
+    gpio_config_pin(GPIOE, GPIO_PIN_4,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIOE, GPIO_PIN_4);               /* amp power ON */
+    /* PB8 = AMP_EN: configured as PP output, LOW at boot (OEM default).
+     * audio_path_enable() sets HIGH before beep. */
+    gpio_config_pin(AMP_EN_PORT, AMP_EN_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(AMP_EN_PORT, AMP_EN_PIN);        /* amp OFF at boot */
+    /* PC12 = BEEP_SW: configured as PP output, HIGH at boot (radio path).
+     * audio_path_enable() sets LOW to route DAC to speaker. */
+    gpio_config_pin(BEEP_SW_PORT, BEEP_SW_PIN,
+                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
+    gpio_set_pin(BEEP_SW_PORT, BEEP_SW_PIN);        /* radio path at boot */
+    IWDG_FEED();
+
+    /* LCD ------------------------------------------------------------ */
+    dbg_puts("[DBG] lcd_init...\n");
+    lcd_init();
+    IWDG_FEED();
+    dbg_puts("[DBG] lcd_backlight...\n");
+    /* LCD backlight on ----------------------------------------------- */
+    gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
+
+    /* LCD diagnostic: fill screen blue to confirm 8080 bus works */
+    dbg_puts("[DBG] lcd_fill blue...\n");
+    lcd_fill_rect(0, 0, 240, 320, 0x001F);  /* RGB565 blue */
+    IWDG_FEED();
+
+    /* -- Audio diagnostic SKIPPED (moved to post-init beep test) -- */
+
+
+    /* Configure PTT and side-button inputs with internal pull-ups.
+     * OEM gpio_modes_init leaves PE0-6 as default (floating input).
+     * We explicitly configure with pull-ups for reliable reads.
+     * OEM @ 0x0801391C: PE2-3 listed as PTT, PE5 as SIDE_KEY. */
+    gpio_config_pin(GPIOE, GPIO_PIN_3, GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOE, GPIO_PIN_3);    /* PE3 pull-UP (PTT1, active LOW) */
+    gpio_config_pin(GPIOE, GPIO_PIN_2, GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOE, GPIO_PIN_2);    /* PE2 pull-UP (PTT2, active LOW) */
+    gpio_config_pin(GPIOE, GPIO_PIN_5, GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOE, GPIO_PIN_5);    /* PE5 pull-UP (TopProg, active LOW) */
+    gpio_config_pin(GPIOE, GPIO_PIN_0, GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOE, GPIO_PIN_0);    /* PE0 pull-UP (PWR_DET) */
+    gpio_config_pin(GPIOA, GPIO_PIN_12, GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOA, GPIO_PIN_12);   /* PA12 pull-UP (BotProg, active LOW) */
+    dbg_puts("[DBG] PTT+direct inputs configured\n");
+
+    /* OEM gpio_modes_init @ 0x0801391C configures additional pins that
+     * we previously omitted. These match OEM boot state per assembly. */
+    gpio_config_pin(GPIOA, GPIO_PIN_2,  GPIO_MODE_INPUT, GPIO_CNF_ANALOG);
+                                        /* PA2: ADC RSSI input (CH2) */
+    gpio_config_pin(GPIOA, GPIO_PIN_3,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOA, GPIO_PIN_3);  /* PA3: BT UART OUT, idle LOW */
+    gpio_config_pin(GPIOA, GPIO_PIN_7,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOA, GPIO_PIN_7);  /* PA7: RF scan latch, idle LOW */
+    gpio_config_pin(GPIOA, GPIO_PIN_11, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIOA, GPIO_PIN_11);   /* PA11: power-off control, idle HIGH */
+    gpio_config_pin(GPIOA, GPIO_PIN_15, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIOA, GPIO_PIN_15);   /* PA15: replay control, idle HIGH */
+    gpio_config_pin(GPIOB, GPIO_PIN_2,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOB, GPIO_PIN_2);  /* PB2: BOOT1 pin, force LOW */
+    gpio_config_pin(GPIOC, GPIO_PIN_5,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOC, GPIO_PIN_5);  /* PC5: RF scan enable, idle LOW */
+    gpio_config_pin(GPIOC, GPIO_PIN_9,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_clear_pin(GPIOC, GPIO_PIN_9);  /* PC9: sideport control, idle LOW */
+    /* PE6 = external PTT input (OEM: input with pull-up) */
+    gpio_config_pin(GPIOE, GPIO_PIN_6,  GPIO_MODE_INPUT, GPIO_CNF_PULL);
+    gpio_set_pin(GPIOE, GPIO_PIN_6);    /* PE6 pull-UP (EXT_PTT, active LOW) */
+    dbg_puts("[DBG] OEM-matching GPIO pins configured\n");
+
+
+    /* Boot indicator: 3 backlight blinks + beep tone.
+     * Uses blocking delays since super_loop isn't running yet.
+     * Confirms SysTick, DAC, and LCD backlight GPIO are working. */
+    dbg_puts("[DBG] boot indicator...\n");
+    {
+        int i;
+        for (i = 0; i < 3; i++) {
+            lcd_backlight_on();
+            dac_audio_play_tone(10000);  /* 1000 Hz */
+            delay_ms(80);
+            IWDG_FEED();
+            lcd_backlight_off();
+            dac_audio_stop();
+            delay_ms(120);
+            IWDG_FEED();
+        }
+        lcd_backlight_on();  /* leave backlight on */
+    }
+}
+
+
+#ifdef HW_TEST
+#include "tests/hw_test.h"
+#include "app/update_listener.h"
+
+int main(void)
+{
+    /* PB9 POWER LATCH FIRST -- before anything else whatsoever.
+     *
+     * The power/volume knob only applies power momentarily; the firmware has to
+     * grab this latch within milliseconds or the radio dies before it finishes
+     * booting. The normal main() does this as its first action for exactly that
+     * reason, but the HW_TEST main() did not, so a test build could power off
+     * cleanly and then refuse to power back on -- the knob would apply power,
+     * the firmware would still be initialising, and it would drop dead again.
+     * Recovering needed a battery pull.
+     *
+     * Bare register writes, not gpio_config_pin(), so this happens before any
+     * driver is touched: GPIOB clock on, PB9 as 2 MHz push-pull output, set. */
+    {
+        volatile uint32_t *apb2en = (volatile uint32_t *)0x40021018UL;
+        *apb2en |= (1UL << 3);                       /* IOPBEN */
+        volatile uint32_t *crh = (volatile uint32_t *)(0x40010C00UL + 0x04UL);
+        uint32_t v = *crh;
+        v &= ~(0xFUL << 4);                          /* PB9 = CRH bits [7:4] */
+        v |=  (0x2UL << 4);                          /* mode 10 (2 MHz), cnf 00 */
+        *crh = v;
+        *(volatile uint32_t *)(0x40010C00UL + 0x10UL) = (1UL << 9);  /* SCR: PB9 high */
+    }
+
+    /* Arm the soft update listener in the hardware tests too. Without it, every
+     * rung of the bring-up ladder would need the side-button + battery-pull
+     * dance to move to the next one, which is most of the cost of testing. */
+    update_listener_init();
+
+    /* The real bring-up, same as production. Tests needing only a subset still
+     * get a correctly initialised radio rather than reimplementing init badly. */
+    hw_init();
+
+#if   HW_TEST == 1
+    test_blinky();
+#elif HW_TEST == 2
+    test_uart_echo();
+#elif HW_TEST == 3
+    test_lcd_pattern();
+#elif HW_TEST == 4
+    test_bk4829_id();
+#elif HW_TEST == 5
+    test_si4732_rev();
+#elif HW_TEST == 6
+    test_spi_flash_id();
+#elif HW_TEST == 7
+    test_adc_monitor();
+#elif HW_TEST == 8
+    test_dac_tone();
+#elif HW_TEST == 9
+    test_keypad_encoder();
+#elif HW_TEST == 10
+    test_gps_display();
+#elif HW_TEST == 11
+    test_full_diagnostic();
+#else
+#error "Unknown HW_TEST value (valid: 1-11)"
+#endif
+    return 0;
+}
+
+#else /* Normal firmware build */
+
 extern uint32_t get_tick(void);
 
 
@@ -149,10 +433,9 @@ extern uint32_t get_tick(void);
 #define IWDG_FEED()  (*(volatile uint32_t *)0x40003000UL = 0x0000AAAAUL)
 
 /* Global calibration data - loaded once in hw_init, used by radio/power */
-calibration_t cal_data;
 
 /* Forward declarations ------------------------------------------------ */
-static void hw_init(void);
+void hw_init(void);
 static void app_init(void);
 
 /* Scheduler task wrappers - adapt module APIs to void(*)(void) ---------- */
@@ -703,265 +986,6 @@ int main(void)
     sched_run();
 
     return 0;  /* unreachable */
-}
-
-/* ========================================================================
- *  hw_init - Bring up all hardware peripherals
- * ======================================================================== */
-
-static void hw_init(void)
-{
-    /* POWER LATCH: PB9 must be held HIGH to keep the radio powered.
-     * The bootloader asserts this briefly; our firmware must take over
-     * immediately or the radio will power off. */
-    gpio_config_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
-
-    IWDG_FEED();
-
-    /* DMA (must be before LCD and DAC) -------------------------------- */
-    dbg_puts("[DBG] dma_init...\n");
-    dma_init();
-    IWDG_FEED();
-
-    /* SPI flash (SPI2) ----------------------------------------------- */
-    dbg_puts("[DBG] spi2_init...\n");
-    spi2_init();
-    IWDG_FEED();
-
-    /* Verify flash chip: expect W25Q16 (Winbond 0xEF, 16Mbit 0x4015)
-     * OEM: periph_init_flash_adc @ 0x08013820 reads JEDEC after SPI2 init.
-     * Valid IDs: 0xEF4015 (W25Q16BV), 0xEF4016 (W25Q32). */
-    {
-        uint32_t jedec = spi_flash_read_id();
-        dbg_reg("[DBG] SPI JEDEC=0x", jedec);
-        if ((jedec & 0xFFFF00) == 0xEF4000)
-            dbg_puts("[DBG] Flash: Winbond W25Q detected OK\n");
-        else if (jedec == 0x000000 || jedec == 0xFFFFFF)
-            dbg_puts("[ERR] Flash: no response (check SPI2 wiring)\n");
-        else
-            dbg_puts("[WARN] Flash: unexpected JEDEC ID\n");
-    }
-
-    /* Flash read sanity: dump first 16B of channel memory (0x0000)
-     * and calibration validity flag (0xF0E0).
-     * OEM: flash_data_load @ 0x08007358 reads these sectors. */
-    {
-        uint8_t sample[16];
-        uint8_t all_ff = 1;
-        spi_flash_read(0x000000, sample, 16);
-        dbg_puts("[DBG] Flash[0x0000]: ");
-        for (int i = 0; i < 16; i++) {
-            dbg_hex8(sample[i]);
-            dbg_puts(" ");
-            if (sample[i] != 0xFF) all_ff = 0;
-        }
-        dbg_puts("\n");
-        if (all_ff)
-            dbg_puts("[WARN] Flash channel sector appears blank\n");
-
-        uint8_t cal_flag;
-        spi_flash_read(0x00F0E0, &cal_flag, 1);
-        dbg_reg("[DBG] Cal flag @ 0xF0E0 = 0x", cal_flag);
-        if (cal_flag == 0xFF)
-            dbg_puts("[WARN] No calibration data programmed\n");
-        else
-            dbg_puts("[DBG] Calibration data present\n");
-    }
-
-    /* Calibration + wear-leveling (needs SPI flash) ------------------
-     * OEM: hw_init_main calls calibration_load then initializes all 5
-     * WL sectors. Bitmap scan @ 0x0800EF68, SYSCFG write @ 0x0800F918. */
-    dbg_puts("[DBG] calibration+wl...\n");
-    calibration_load(&cal_data);
-
-    wl_init(&WL_SYSCFG);
-    wl_init(&WL_VFOCFG);
-    wl_init(&WL_EXTCFG);
-    wl_init(&WL_VFOSEL);
-    wl_init(&WL_CHCFG);
-
-    /* Probe each WL sector: attempt a read to check valid/empty/corrupt.
-     * OEM validates sectors on boot before dispatching main task loop.
-     * Buffer must be large enough for the LARGEST record (EXTCFG = 160B). */
-    {
-        uint8_t probe[160];
-        const char *names[] = {"SYSCFG","VFOCFG","EXTCFG","VFOSEL","CHCFG "};
-        (void)names;
-        const wl_sector_t *secs[] = {&WL_SYSCFG,&WL_VFOCFG,&WL_EXTCFG,&WL_VFOSEL,&WL_CHCFG};
-        for (int i = 0; i < 5; i++) {
-            int rc = wl_read(secs[i], probe);
-            (void)rc;
-            dbg_puts("[DBG] WL ");
-            dbg_puts(names[i]);
-            dbg_puts(rc == 0 ? ": valid\n" : ": empty/uninitialized\n");
-        }
-    }
-    IWDG_FEED();
-
-    /* BK4829 dual RF transceivers (GPIOE bit-bang) ------------------- */
-    /* Configure BK4829 SPI GPIO pins as outputs before init.
-     * OEM gpio_modes_init @ 0x0801391C: configures PE8/10/11/15 as
-     * push-pull outputs and resets them LOW (CS idle = HIGH after init). */
-    dbg_puts("[DBG] bk4829_gpio_init...\n");
-    gpio_config_pin(BK4829_SEN1_PORT, BK4829_SEN1_PIN,
-                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE8 = SEN1 */
-    gpio_set_pin(BK4829_SEN1_PORT, BK4829_SEN1_PIN);       /* CS idle HIGH */
-    gpio_config_pin(BK4829_SEN2_PORT, BK4829_SEN2_PIN,
-                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE15 = SEN2 */
-    gpio_set_pin(BK4829_SEN2_PORT, BK4829_SEN2_PIN);       /* CS idle HIGH */
-    gpio_config_pin(BK4829_SCK_PORT, BK4829_SCK_PIN,
-                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE10 = SCK */
-    gpio_clear_pin(BK4829_SCK_PORT, BK4829_SCK_PIN);       /* SCK idle LOW */
-    gpio_config_pin(BK4829_SDA_PORT, BK4829_SDA_PIN,
-                    GPIO_MODE_OUT_50MHZ, GPIO_CNF_PP);      /* PE11 = SDA */
-
-    /* BK4829 full init + frequency programming happens in
-     * radio_init() → vfo_init() during app_init phase.
-     * Removed from here to avoid double-init HardFault. */
-    dbg_puts("[DBG] bk4829 GPIO ready (init deferred to vfo_init)\n");
-    IWDG_FEED();
-
-    /* SI4732 broadcast receiver (GPIOB bit-bang I2C) ----------------- */
-    dbg_puts("[DBG] si4732_init SKIPPED (radio disabled)\n");
-    IWDG_FEED();
-
-    /* UARTs ---------------------------------------------------------- */
-    dbg_puts("[DBG] uart_bt_init...\n");
-    bt_init();              /* USART1 @ 115200 - Bluetooth + AT config */
-    IWDG_FEED();
-    dbg_puts("[DBG] uart_gps_init...\n");
-    uart_gps_init();        /* USART3 @ 9600 - GPS (PB10/PB11) */
-    IWDG_FEED();
-
-    /* ADC (battery + audio level) ------------------------------------ */
-    dbg_puts("[DBG] adc_init...\n");
-    adc_init();
-    IWDG_FEED();
-
-    /* DAC + TIM6 (CTCSS/AFSK tone generation) ----------------------- */
-    dbg_puts("[DBG] dac_audio_init...\n");
-    dac_audio_init();
-    IWDG_FEED();
-
-    /* Audio routing GPIO init (OEM gpio_modes_init @ 0x0801391C).
-     * OEM configures ALL audio path pins in gpio_modes_init:
-     *   PE7  (U3T_EN)  = GP push-pull output - ACTIVE LOW relay
-     *                     HIGH = RX/speaker (deasserted), LOW = TX/mic
-     *   PE9  (SW_TO_BT) = GP push-pull output, LOW → speaker (not BT)
-     *   PE1  (SPK_MUTE) = GP push-pull output, LOW → unmuted
-     *   PC12 (BEEP_SW)  = GP push-pull output, LOW at boot (enabled per-beep)
-     *   PB8  (AMP_EN)   = GP push-pull output, LOW at boot (enabled per-beep)
-     *
-     * OEM boot state: PB8=LOW, PC12=LOW - both enabled only during beep_play.
-     * PE7=HIGH (RX mode), PE9=LOW (speaker not BT), PE1=LOW (unmuted). */
-    dbg_puts("[DBG] spk_unmute+beep_sw...\n");
-    /* PE7 = U3T_EN: HIGH = RX/speaker mode (relay deasserted, ACTIVE LOW) */
-    gpio_config_pin(GPIOE, GPIO_PIN_7,
-                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
-    gpio_set_pin(GPIOE, GPIO_PIN_7);                /* RX audio mode */
-    /* PE9 = SW_TO_BT: LOW = speaker path (not Bluetooth) */
-    gpio_config_pin(GPIOE, GPIO_PIN_9,
-                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(GPIOE, GPIO_PIN_9);              /* speaker mode */
-    /* PE1 = SPK_MUTE: LOW = unmuted */
-    gpio_config_pin(SPK_MUTE_PORT, SPK_MUTE_PIN,
-                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(SPK_MUTE_PORT, SPK_MUTE_PIN);   /* unmute speaker */
-    /* PE4 = AMP_PWR: powers the audio amplifier rail (V12 discovery).
-     * Must be HIGH for any audio output. */
-    gpio_config_pin(GPIOE, GPIO_PIN_4,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(GPIOE, GPIO_PIN_4);               /* amp power ON */
-    /* PB8 = AMP_EN: configured as PP output, LOW at boot (OEM default).
-     * audio_path_enable() sets HIGH before beep. */
-    gpio_config_pin(AMP_EN_PORT, AMP_EN_PIN,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(AMP_EN_PORT, AMP_EN_PIN);        /* amp OFF at boot */
-    /* PC12 = BEEP_SW: configured as PP output, HIGH at boot (radio path).
-     * audio_path_enable() sets LOW to route DAC to speaker. */
-    gpio_config_pin(BEEP_SW_PORT, BEEP_SW_PIN,
-                    GPIO_MODE_OUT_10MHZ, GPIO_CNF_PP);
-    gpio_set_pin(BEEP_SW_PORT, BEEP_SW_PIN);        /* radio path at boot */
-    IWDG_FEED();
-
-    /* LCD ------------------------------------------------------------ */
-    dbg_puts("[DBG] lcd_init...\n");
-    lcd_init();
-    IWDG_FEED();
-    dbg_puts("[DBG] lcd_backlight...\n");
-    /* LCD backlight on ----------------------------------------------- */
-    gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
-
-    /* LCD diagnostic: fill screen blue to confirm 8080 bus works */
-    dbg_puts("[DBG] lcd_fill blue...\n");
-    lcd_fill_rect(0, 0, 240, 320, 0x001F);  /* RGB565 blue */
-    IWDG_FEED();
-
-    /* -- Audio diagnostic SKIPPED (moved to post-init beep test) -- */
-
-
-    /* Configure PTT and side-button inputs with internal pull-ups.
-     * OEM gpio_modes_init leaves PE0-6 as default (floating input).
-     * We explicitly configure with pull-ups for reliable reads.
-     * OEM @ 0x0801391C: PE2-3 listed as PTT, PE5 as SIDE_KEY. */
-    gpio_config_pin(GPIOE, GPIO_PIN_3, GPIO_MODE_INPUT, GPIO_CNF_PULL);
-    gpio_set_pin(GPIOE, GPIO_PIN_3);    /* PE3 pull-UP (PTT1, active LOW) */
-    gpio_config_pin(GPIOE, GPIO_PIN_2, GPIO_MODE_INPUT, GPIO_CNF_PULL);
-    gpio_set_pin(GPIOE, GPIO_PIN_2);    /* PE2 pull-UP (PTT2, active LOW) */
-    gpio_config_pin(GPIOE, GPIO_PIN_5, GPIO_MODE_INPUT, GPIO_CNF_PULL);
-    gpio_set_pin(GPIOE, GPIO_PIN_5);    /* PE5 pull-UP (TopProg, active LOW) */
-    gpio_config_pin(GPIOE, GPIO_PIN_0, GPIO_MODE_INPUT, GPIO_CNF_PULL);
-    gpio_set_pin(GPIOE, GPIO_PIN_0);    /* PE0 pull-UP (PWR_DET) */
-    gpio_config_pin(GPIOA, GPIO_PIN_12, GPIO_MODE_INPUT, GPIO_CNF_PULL);
-    gpio_set_pin(GPIOA, GPIO_PIN_12);   /* PA12 pull-UP (BotProg, active LOW) */
-    dbg_puts("[DBG] PTT+direct inputs configured\n");
-
-    /* OEM gpio_modes_init @ 0x0801391C configures additional pins that
-     * we previously omitted. These match OEM boot state per assembly. */
-    gpio_config_pin(GPIOA, GPIO_PIN_2,  GPIO_MODE_INPUT, GPIO_CNF_ANALOG);
-                                        /* PA2: ADC RSSI input (CH2) */
-    gpio_config_pin(GPIOA, GPIO_PIN_3,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(GPIOA, GPIO_PIN_3);  /* PA3: BT UART OUT, idle LOW */
-    gpio_config_pin(GPIOA, GPIO_PIN_7,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(GPIOA, GPIO_PIN_7);  /* PA7: RF scan latch, idle LOW */
-    gpio_config_pin(GPIOA, GPIO_PIN_11, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(GPIOA, GPIO_PIN_11);   /* PA11: power-off control, idle HIGH */
-    gpio_config_pin(GPIOA, GPIO_PIN_15, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(GPIOA, GPIO_PIN_15);   /* PA15: replay control, idle HIGH */
-    gpio_config_pin(GPIOB, GPIO_PIN_2,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(GPIOB, GPIO_PIN_2);  /* PB2: BOOT1 pin, force LOW */
-    gpio_config_pin(GPIOC, GPIO_PIN_5,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(GPIOC, GPIO_PIN_5);  /* PC5: RF scan enable, idle LOW */
-    gpio_config_pin(GPIOC, GPIO_PIN_9,  GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_clear_pin(GPIOC, GPIO_PIN_9);  /* PC9: sideport control, idle LOW */
-    /* PE6 = external PTT input (OEM: input with pull-up) */
-    gpio_config_pin(GPIOE, GPIO_PIN_6,  GPIO_MODE_INPUT, GPIO_CNF_PULL);
-    gpio_set_pin(GPIOE, GPIO_PIN_6);    /* PE6 pull-UP (EXT_PTT, active LOW) */
-    dbg_puts("[DBG] OEM-matching GPIO pins configured\n");
-
-
-    /* Boot indicator: 3 backlight blinks + beep tone.
-     * Uses blocking delays since super_loop isn't running yet.
-     * Confirms SysTick, DAC, and LCD backlight GPIO are working. */
-    dbg_puts("[DBG] boot indicator...\n");
-    {
-        int i;
-        for (i = 0; i < 3; i++) {
-            lcd_backlight_on();
-            dac_audio_play_tone(10000);  /* 1000 Hz */
-            delay_ms(80);
-            IWDG_FEED();
-            lcd_backlight_off();
-            dac_audio_stop();
-            delay_ms(120);
-            IWDG_FEED();
-        }
-        lcd_backlight_on();  /* leave backlight on */
-    }
 }
 
 /* ========================================================================
