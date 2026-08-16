@@ -194,53 +194,72 @@ void test_blinky(void)
 {
     test_debug_init();
 
+    /* Hold the power latch, exactly as the real firmware does. */
+    gpio_config_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
+
     gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
     lcd_init();
     lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x0000);
 
-    lcd_draw_string(6,  4, "POWER SWITCH TEST", 0xFFE0, 0x0000);
-    lcd_draw_string(6, 18, "turn volume knob OFF", 0x07FF, 0x0000);
-    dbg_println("POWER SWITCH TEST (PE0 / PB9 latch)");
-
-    /* The power latch must be held or the radio drops dead immediately. main()
-     * asserts PB9 before anything else; keep it asserted here too. */
-    gpio_config_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
-    gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
-
+    keypad_init();
     power_init();
 
-    /* Power-off is implemented in power.c but is registered as a SCHEDULER
-     * task, and the hardware tests never run the scheduler -- which is why the
-     * volume knob appears dead in every test build. Polling it here at the
-     * same 20 ms rate the scheduler would gives the tests the same behaviour
-     * as the real firmware.
+    lcd_draw_string(6,  4, "PA11 POWER-OFF TEST", 0xFFE0, 0x0000);
+    lcd_draw_string(6, 18, "1 = PA11 HIGH", 0x07E0, 0x0000);
+    lcd_draw_string(6, 30, "3 = PA11 LOW", 0x07E0, 0x0000);
+    lcd_draw_string(6, 42, "7 = release (input)", 0x07FF, 0x0000);
+    lcd_draw_string(6, 60, "knob OFF = normal path", 0xFFFF, 0x0000);
+    dbg_println("PA11 POWER-OFF TEST");
+
+    /* PA11 is documented in the pinmap as "DEVICE POWER OFF - software
+     * power-off trigger" and NOTHING in this codebase drives it. Releasing the
+     * PB9 enable latch demonstrably does not collapse the rail -- proved by the
+     * CPU still running afterwards to notice the knob and reset itself -- so
+     * PA11 is the likely real mechanism for a genuine hardware power cut.
      *
-     * PE0 reads LOW with the switch ON (grounded) and HIGH when turned OFF.
-     * power_button_poll() requires 1.5 s of sustained OFF before releasing the
-     * PB9 latch, so a brief wobble while turning the volume will not shut the
-     * radio down. */
+     * Polarity is unknown and guessing costs a flash cycle each way, so both
+     * are bound to keys. PA11 starts as a floating INPUT: driving an unknown
+     * power rail at boot is how radios get bricked, and leaving it high-Z
+     * matches the state it has had all along.
+     *
+     * Note PA11 is NOT the side button -- that is PA12 (BOT_PROG). No conflict
+     * with bootloader entry. */
+    GPIO_TypeDef *A = (GPIO_TypeDef *)GPIOA_BASE;
+    gpio_config_pin(A, GPIO_PIN_11, GPIO_MODE_INPUT, GPIO_CNF_FLOATING);
+
     uint32_t hb = 0;
+    const char *state = "input(hi-Z)";
+
     while (1) {
-        /* Re-enabled: power_off() now RESETS rather than halting when the
-         * supply does not collapse, matching what Radtel's own RT-900 does.
-         * Previously this loop had to be disabled because a power-off left the
-         * CPU spinning with interrupts off and only a battery pull could
-         * recover it. */
         power_button_poll();
 
-        if ((hb % 25u) == 0u) {
-            uint8_t pe0 = (PWR_SWITCH_PORT->IDR & PWR_SWITCH_PIN) ? 1 : 0;
-            uint8_t pb9 = (GPIO_PB9_PWREN_PORT->ODR & GPIO_PB9_PWREN_PIN) ? 1 : 0;
-            draw_kv(44, "PE0 (sw): ", pe0, pe0 ? 0xF800 : 0x07E0);
-            draw_kv(58, "  0=ON 1=OFF", 0, 0x07FF);
-            draw_kv(78, "PB9 latch:", pb9, pb9 ? 0x07E0 : 0xF800);
-            draw_kv(98, "seconds:  ", hb / 50u, 0xFFFF);
+        key_event_t ev;
+        if (keypad_get_event(&ev) && ev.type == KEY_EVT_PRESS) {
+            if (ev.key == KEY_1) {
+                dbg_println("[PA11] drive HIGH");
+                gpio_config_pin(A, GPIO_PIN_11, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+                gpio_set_pin(A, GPIO_PIN_11);
+                state = "HIGH";
+            } else if (ev.key == KEY_3) {
+                dbg_println("[PA11] drive LOW");
+                gpio_config_pin(A, GPIO_PIN_11, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+                gpio_clear_pin(A, GPIO_PIN_11);
+                state = "LOW";
+            } else if (ev.key == KEY_7) {
+                dbg_println("[PA11] release to input");
+                gpio_config_pin(A, GPIO_PIN_11, GPIO_MODE_INPUT, GPIO_CNF_FLOATING);
+                state = "input(hi-Z)";
+            }
+            lcd_fill_rect(1, 80, LCD_WIDTH - 2, 20, 0x0000);
+            lcd_draw_string(6, 84, "PA11:", 0xFFFF, 0x0000);
+            lcd_draw_string(56, 84, state, 0xFFE0, 0x0000);
+        }
 
-            dbg_puts("PE0=");  dbg_dec(pe0);
-            dbg_puts(" PB9="); dbg_dec(pb9);
-            dbg_newline();
+        if ((hb % 50u) == 0u) {
+            dbg_puts("alive PA11="); dbg_puts(state); dbg_newline();
         }
         hb++;
         delay_ms(20);

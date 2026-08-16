@@ -394,6 +394,25 @@ void power_off(void)
      * core is in WFI most of the time, and this state is only ever reached if
      * the hardware failed to cut power -- in which case something is drawing
      * current regardless. */
+    /* Shed everything we can before idling.
+     *
+     * The rail does not collapse when PB9 is released -- proved by the fact
+     * that this code keeps executing -- and PA11, which the pinmap labels
+     * "DEVICE POWER OFF", does nothing on either polarity. So a true hardware
+     * cut has not been found, and "off" means "idle as quietly as possible".
+     *
+     * Killing the peripheral clocks is most of the win: the LCD controller,
+     * SPI, timers, ADC, DMA and the spare UARTs all stop drawing. GPIOE stays
+     * clocked because PE0 must remain readable to notice the switch, and GPIOB
+     * because PB9 is still driven. The core itself spends nearly all its time
+     * halted in WFI below.
+     *
+     * This is a mitigation, not a fix. A genuine power cut would be better and
+     * is still worth finding. */
+    CRM->APB1EN = 0;
+    CRM->APB2EN = (1UL << 3) | (1UL << 6);   /* IOPBEN | IOPEEN only */
+    CRM->AHBEN  = 0;
+
     for (;;) {
         for (volatile uint32_t i = 0; i < 200000UL; i++)
             ;
