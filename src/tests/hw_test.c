@@ -34,6 +34,7 @@
 #include "app/update_listener.h"
 #include "app/encoder.h"
 #include "app/gps.h"
+#include "app/power.h"
 
 extern void delay_ms(uint32_t ms);
 extern uint32_t get_tick(void);
@@ -198,50 +199,57 @@ void test_blinky(void)
     lcd_init();
     lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x0000);
 
-    keypad_init();
-    encoder_init();
+    lcd_draw_string(6,  4, "POWER SWITCH TEST", 0xFFE0, 0x0000);
+    lcd_draw_string(6, 18, "turn volume knob OFF", 0x07FF, 0x0000);
+    dbg_println("POWER SWITCH TEST (PE0 / PB9 latch)");
 
-    lcd_draw_string(6,  4, "KEY + KNOB TEST", 0xFFE0, 0x0000);
-    lcd_draw_string(6, 18, "press any key", 0x07FF, 0x0000);
-    dbg_println("KEY+KNOB TEST: driver-level");
+    /* The power latch must be held or the radio drops dead immediately. main()
+     * asserts PB9 before anything else; keep it asserted here too. */
+    gpio_config_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN,
+                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
 
-    /* Names indexed by KEY_* code, so the driver's own output can be read
-     * directly instead of decoded by hand. */
-    static const char *names[] = {
-        "1","2","3","A/VFO", "4","5","6","B/SCAN",
-        "7","8","9","C/MENU", "*","0","#","D/BAND",
-        "UP","DOWN","LEFT","RIGHT", "SIDE1","SIDE4"
-    };
+    power_init();
 
-    uint32_t keys = 0, det = 0;
-    int32_t pos = 0;
-
+    /* Power-off is implemented in power.c but is registered as a SCHEDULER
+     * task, and the hardware tests never run the scheduler -- which is why the
+     * volume knob appears dead in every test build. Polling it here at the
+     * same 20 ms rate the scheduler would gives the tests the same behaviour
+     * as the real firmware.
+     *
+     * PE0 reads LOW with the switch ON (grounded) and HIGH when turned OFF.
+     * power_button_poll() requires 1.5 s of sustained OFF before releasing the
+     * PB9 latch, so a brief wobble while turning the volume will not shut the
+     * radio down. */
+    uint32_t hb = 0;
     while (1) {
-        int8_t d = encoder_poll();
-        if (d) {
-            det++;
-            pos += (d > 0) ? 1 : -1;
-            draw_kv(100, "detents:  ", det, 0xFFFF);
-            draw_kv(114, "position: ", (uint32_t)(pos < 0 ? -pos : pos),
-                    pos < 0 ? 0xF800 : 0x07E0);
-        }
+        /* power_button_poll() is DELIBERATELY NOT CALLED.
+         *
+         * Power-off works -- PE0 is detected and releasing the PB9 latch cuts
+         * the supply. But the radio will not come back on afterwards, even with
+         * PB9 asserted in Reset_Handler, which is the earliest instruction the
+         * CPU can execute. That rules out latch timing: the knob is not
+         * restoring power at all, and recovery needs the battery out.
+         *
+         * A power-off that costs a battery pull to undo is worse than none, so
+         * the test builds observe the switch without acting on it. The real
+         * firmware still registers power_button_poll() as a scheduler task; this
+         * only affects HW_TEST. */
 
-        key_event_t ev;
-        if (keypad_get_event(&ev)) {
-            if (ev.type == KEY_EVT_PRESS) {
-                keys++;
-                const char *nm = (ev.key < 22) ? names[ev.key] : "?";
-                lcd_fill_rect(1, 44, LCD_WIDTH - 2, 30, 0x0000);
-                lcd_draw_string_2x(6, 46, nm, 0xFFE0, 0x0000);
-                draw_kv(80, "presses:  ", keys, 0xFFFF);
-                dbg_puts("[KEY] ");
-                dbg_puts(nm);
-                dbg_puts(" code=");
-                dbg_dec(ev.key);
-                dbg_newline();
-            }
+        if ((hb % 25u) == 0u) {
+            uint8_t pe0 = (PWR_SWITCH_PORT->IDR & PWR_SWITCH_PIN) ? 1 : 0;
+            uint8_t pb9 = (GPIO_PB9_PWREN_PORT->ODR & GPIO_PB9_PWREN_PIN) ? 1 : 0;
+            draw_kv(44, "PE0 (sw): ", pe0, pe0 ? 0xF800 : 0x07E0);
+            draw_kv(58, "  0=ON 1=OFF", 0, 0x07FF);
+            draw_kv(78, "PB9 latch:", pb9, pb9 ? 0x07E0 : 0xF800);
+            draw_kv(98, "seconds:  ", hb / 50u, 0xFFFF);
+
+            dbg_puts("PE0=");  dbg_dec(pe0);
+            dbg_puts(" PB9="); dbg_dec(pb9);
+            dbg_newline();
         }
-        delay_ms(5);
+        hb++;
+        delay_ms(20);
     }
 }
 

@@ -27,6 +27,29 @@
 
 int main(void)
 {
+    /* PB9 POWER LATCH FIRST -- before anything else whatsoever.
+     *
+     * The power/volume knob only applies power momentarily; the firmware has to
+     * grab this latch within milliseconds or the radio dies before it finishes
+     * booting. The normal main() does this as its first action for exactly that
+     * reason, but the HW_TEST main() did not, so a test build could power off
+     * cleanly and then refuse to power back on -- the knob would apply power,
+     * the firmware would still be initialising, and it would drop dead again.
+     * Recovering needed a battery pull.
+     *
+     * Bare register writes, not gpio_config_pin(), so this happens before any
+     * driver is touched: GPIOB clock on, PB9 as 2 MHz push-pull output, set. */
+    {
+        volatile uint32_t *apb2en = (volatile uint32_t *)0x40021018UL;
+        *apb2en |= (1UL << 3);                       /* IOPBEN */
+        volatile uint32_t *crh = (volatile uint32_t *)(0x40010C00UL + 0x04UL);
+        uint32_t v = *crh;
+        v &= ~(0xFUL << 4);                          /* PB9 = CRH bits [7:4] */
+        v |=  (0x2UL << 4);                          /* mode 10 (2 MHz), cnf 00 */
+        *crh = v;
+        *(volatile uint32_t *)(0x40010C00UL + 0x10UL) = (1UL << 9);  /* SCR: PB9 high */
+    }
+
     /* Arm the soft update listener in the hardware tests too. Without it, every
      * rung of the bring-up ladder would need the side-button + battery-pull
      * dance to move to the next one, which is most of the cost of testing. */

@@ -261,6 +261,36 @@ void Reset_Handler(void)
 {
     uint32_t *src, *dst;
 
+    /* PB9 POWER LATCH -- the very first thing the CPU does.
+     *
+     * The power/volume knob applies power only momentarily. The firmware has to
+     * assert this latch to hold its own supply up, and the window is shorter
+     * than the boot path: asserting it at the top of main() was still too late,
+     * because SystemInit() runs first and spends time waiting for the PLL to
+     * lock. The radio powered off correctly but would not power back on -- the
+     * knob applied power, the CPU started booting, and the supply collapsed
+     * before it ever reached main().
+     *
+     * So it happens here, before .data is copied, before .bss is cleared,
+     * before SystemInit. Bare register writes only: nothing has been
+     * initialised yet, so this cannot depend on a driver, a global, or even a
+     * function call that might live in a section not yet set up.
+     *
+     *   CRM APB2EN (0x40021018) bit 3 -> GPIOB clock
+     *   GPIOB CRH  (0x40010C04) [7:4] -> PB9 = output 2 MHz push-pull
+     *   GPIOB SCR  (0x40010C10) bit 9 -> PB9 high
+     */
+    *(volatile uint32_t *)0x40021018UL |= (1UL << 3);   /* IOPBEN */
+    *(volatile uint32_t *)0x40021018UL;                  /* read-back fence */
+    {
+        volatile uint32_t *crh = (volatile uint32_t *)0x40010C04UL;
+        uint32_t v = *crh;
+        v &= ~(0xFUL << 4);
+        v |=  (0x2UL << 4);
+        *crh = v;
+    }
+    *(volatile uint32_t *)0x40010C10UL = (1UL << 9);     /* SCR: PB9 high */
+
 #ifdef DEBUG_UART
     /* Ultra-early debug: init UART4 with raw register writes.
      * No .data/.bss dependency - pure hardware register setup.
