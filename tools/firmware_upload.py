@@ -312,15 +312,26 @@ class FirmwareUploader:
         # started is not mistaken for a reply.
         self.ser.reset_input_buffer()
 
+        # ACKs are best-effort, not a gate.
+        #
+        # The radio hands itself to the bootloader as soon as it recognises the
+        # sequence, and from that moment the far end is speaking the 0xAA-framed
+        # bootloader protocol rather than sending a bare 0x06. A missing ACK
+        # therefore proves nothing -- an earlier version aborted here having
+        # received "aa5200e10000c6b055", which IS the bootloader answering.
+        #
+        # What actually matters is whether the bootloader is now listening, and
+        # probe() already establishes that. So send the sequence, report what
+        # came back, and let the probe decide.
         self.send_raw(HANDSHAKE_STRING)
-        if not self._wait_ack("Handshake"):
-            return False
+        got_hs = self._wait_ack("Handshake", timeout=2.0)
 
         self.send_raw(UPDATE_STRING)
-        if not self._wait_ack("UPDATE"):
-            return False
+        got_up = self._wait_ack("UPDATE", timeout=2.0)
 
-        print("  Radio entering bootloader mode")
+        if not (got_hs and got_up):
+            print("  (no clean ACK -- continuing; the probe decides)")
+        print("  Radio should now be in bootloader mode")
         return True
 
     def send_command(self, cmd: int, args: int = 0, data: bytes = b"",

@@ -54,6 +54,12 @@
 #define update_listener_init()          ((void)0)
 #define update_listener_feed(c)         ((void)(c))
 #define update_listener_triggered()     (0)
+#define update_listener_rx_count()      (0)
+#define update_listener_last_byte()     (0)
+#define update_listener_stage()         (0)
+#define update_listener_matched()       (0)
+#define update_listener_cap_count()     (0)
+#define update_listener_cap_byte(i)     ((void)(i), 0)
 #else
 
 /* Arm the listener. Call as early as possible -- before hw_init() -- so a
@@ -65,6 +71,14 @@ void update_listener_init(void);
 /* Feed one received byte. Called from UART4_IRQHandler in drivers/uart.c,
  * which owns that vector. */
 void update_listener_feed(uint8_t c);
+
+/* Diagnostics -- see the note in update_listener.c. */
+uint32_t update_listener_rx_count(void);
+uint8_t  update_listener_last_byte(void);
+uint8_t  update_listener_stage(void);
+uint8_t  update_listener_matched(void);
+uint8_t  update_listener_cap_count(void);
+uint8_t  update_listener_cap_byte(uint8_t i);
 
 /* Non-zero once the full handshake has been seen. Mostly for diagnostics --
  * the handover happens inside the ISR, so this rarely gets observed. */

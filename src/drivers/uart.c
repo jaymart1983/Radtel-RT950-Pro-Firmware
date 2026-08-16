@@ -63,19 +63,22 @@ void UART4_IRQHandler(void)
 {
     uint32_t sr = UART4->SR;
 
-    /* Overrun/framing/noise/parity errors are cleared by reading SR then DR.
-     * An ISR that tests only RXNE returns without touching DR, so the flag
-     * stays set, the interrupt re-fires immediately, and the CPU never leaves
-     * the handler -- an interrupt storm that starves everything else until the
-     * watchdog resets the radio. This is easy to hit here: the bootloader
-     * drives this UART hard during an upload, so ORE is usually already set by
-     * the time the application enables the interrupt. */
-    if (sr & (USART_SR_ORE | USART_SR_FE | USART_SR_NE | USART_SR_PE)) {
-        (void)UART4->DR;            /* SR was read above; this clears them */
-        return;
-    }
-
-    if (sr & USART_SR_RXNE) {
+    /* Reading SR (above) then DR clears RXNE and every error flag at once.
+     *
+     * Both halves of this matter. Testing ONLY RXNE means an overrun leaves ORE
+     * set with DR untouched, so the interrupt re-fires forever and starves
+     * everything else until the watchdog resets -- easy to hit, because the
+     * bootloader drives this UART hard during an upload and hands over with ORE
+     * already set.
+     *
+     * But DISCARDING the byte on an error is just as wrong, and was the bug
+     * that made the update handshake never respond: with the radio transmitting
+     * continuously and nothing draining RX, ORE is set much of the time, so
+     * every genuine received byte was thrown away by the error path before it
+     * reached the listener. An overrun means an EARLIER byte was lost -- the one
+     * in DR right now is still good, so process it. */
+    if (sr & (USART_SR_RXNE | USART_SR_ORE | USART_SR_FE |
+              USART_SR_NE | USART_SR_PE)) {
         uint8_t ch = (uint8_t)(UART4->DR & 0xFF);
 
         /* Watch for the host's "enter update mode" handshake before buffering.

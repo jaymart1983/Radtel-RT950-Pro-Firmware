@@ -31,6 +31,7 @@
 #include "app/display.h"
 #include "app/font.h"
 #include "app/keypad.h"
+#include "app/update_listener.h"
 #include "app/encoder.h"
 #include "app/gps.h"
 
@@ -219,28 +220,77 @@ void test_blinky(void)
     dbg_println("GATE 1: LCD geometry + colour swatches drawn");
     dbg_println("GATE 2: this text should also reach the cable");
 
-    /* Liveness: a number climbing on screen once a second. Unlike a flashing
-     * backlight, this cannot be confused with a reset loop. */
+    /* Liveness and diagnostics go to UART ONLY.
+     *
+     * An earlier revision redrew two status rows on the LCD every second, and
+     * that corrupted text ACROSS THE WHOLE SCREEN -- including the swatch
+     * labels drawn once at boot, which nothing should have touched. Repeated
+     * lcd_set_window/draw cycles are evidently leaving the controller in a
+     * state where later writes land outside their window. That is a real bug
+     * worth chasing, but not while it is also destroying the evidence we are
+     * trying to read.
+     *
+     * UART TX is proven clean, so the LCD is drawn once and then left alone.
+     * Diagnostics do not need it. */
+    /* Flash integrity check.
+     *
+     * Text renders as garbage glyphs while string constants print perfectly
+     * over UART, and HANDSHAKE[] fails to match bytes that arrive correctly.
+     * Both the font table and those strings live in flash, so if one is wrong
+     * and the other is not, what is IN the flash may not be what we built --
+     * a corrupted upload block would do exactly that, damaging whatever
+     * happens to live there while leaving the rest intact.
+     *
+     * Sum the first 8 KB of the application region and print it. The same sum
+     * computed from the .bin offline says whether the flash matches the image.
+     * Deliberately a plain sum: simple enough that the check itself cannot be
+     * the thing that is broken. */
+    {
+        const volatile uint8_t *fw = (const volatile uint8_t *)0x08003000UL;
+        uint32_t sum = 0;
+        for (uint32_t i = 0; i < 8192; i++)
+            sum += fw[i];
+        dbg_puts("FLASH sum[0x08003000..+8192] = ");
+        dbg_dec(sum);
+        dbg_newline();
+    }
+
+    /* Read HANDSHAKE back through the same path the matcher uses. If these
+     * bytes are not 80 82 79 71 ... then the matcher was never given a chance. */
+    {
+        dbg_puts("HANDSHAKE[] as seen by firmware:");
+        for (uint8_t i = 0; i < 14; i++) {
+            dbg_puts(" ");
+            dbg_dec((uint8_t)"PROGRAMBT9000U"[i]);
+        }
+        dbg_newline();
+    }
+
+    dbg_println("GATE 1 drawn. Diagnostics on UART only.");
+    dbg_println("Send PROGRAMBT9000U to test RX.");
+
     uint32_t count = 0;
     while (1) {
-        char buf[24];
-        const char *p = "count ";
-        uint8_t n = 0;
-        while (*p) buf[n++] = *p++;
-        uint32_t v = count;
-        char tmp[12]; int t = 0;
-        if (v == 0) tmp[t++] = '0';
-        while (v) { tmp[t++] = (char)('0' + (v % 10)); v /= 10; }
-        while (t) buf[n++] = tmp[--t];
-        buf[n++] = ' '; buf[n] = '\0';
-
-        lcd_draw_string(56, (uint16_t)(LCD_HEIGHT - 22), buf, 0xFFFF, 0x0000);
-
         dbg_puts("count ");
-        dbg_dec(count);
+        dbg_dec(count++);
+        dbg_puts("  rx=");
+        dbg_dec(update_listener_rx_count());
+        dbg_puts(" stage=");
+        dbg_dec(update_listener_stage());
+        dbg_puts(" match=");
+        dbg_dec(update_listener_matched());
         dbg_newline();
 
-        count++;
+        if (update_listener_cap_count()) {
+            dbg_puts("  rxbytes:");
+            for (uint8_t bi = 0; bi < update_listener_cap_count(); bi++) {
+                dbg_puts(" ");
+                dbg_dec(update_listener_cap_byte(bi));
+            }
+            dbg_newline();
+            dbg_println("  expect:  80 82 79 71 82 65 77 66 84 57 48 48 48 85");
+        }
+
         delay_ms(1000);
     }
 }

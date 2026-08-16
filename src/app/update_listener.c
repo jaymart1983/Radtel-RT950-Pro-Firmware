@@ -38,6 +38,34 @@ static volatile uint8_t up_matched;   /* bytes of UPDATE matched so far */
 static volatile uint8_t stage;        /* 0 = want handshake, 1 = want UPDATE */
 static volatile uint8_t triggered;
 
+/* Diagnostics. Distinguishes three very different failures that all present
+ * identically as "the handshake did not work":
+ *   rx_count == 0          -> nothing is being received at all (RX path dead)
+ *   rx_count > 0, stage 0  -> bytes arrive but never match the handshake
+ *   stage == 1             -> handshake matched, UPDATE did not follow
+ */
+static volatile uint32_t rx_count;
+static volatile uint8_t  last_byte;
+
+/* First bytes received, captured verbatim. rx_count proved the RX path works
+ * (exactly 14 bytes arrive for a 14-byte handshake) while the matcher never
+ * matched, so the transport is fine and the DATA is wrong. Nothing short of
+ * the raw bytes will say why. */
+#define RX_CAP 16
+static volatile uint8_t  rx_cap[RX_CAP];
+static volatile uint8_t  rx_cap_n;
+
+uint8_t update_listener_cap_count(void) { return rx_cap_n; }
+uint8_t update_listener_cap_byte(uint8_t i)
+{
+    return (i < RX_CAP) ? rx_cap[i] : 0;
+}
+
+uint32_t update_listener_rx_count(void) { return rx_count; }
+uint8_t  update_listener_last_byte(void) { return last_byte; }
+uint8_t  update_listener_stage(void)     { return stage; }
+uint8_t  update_listener_matched(void)   { return hs_matched; }
+
 uint8_t update_listener_triggered(void) { return triggered; }
 
 /* Blocking single-byte TX. Used only to ACK, where a couple of character times
@@ -171,6 +199,9 @@ void update_listener_enter_bootloader(void)
  * seen even in builds where CPS never drains the ring buffer. */
 void update_listener_feed(uint8_t c)
 {
+    rx_count++;
+    last_byte = c;
+    if (rx_cap_n < RX_CAP) rx_cap[rx_cap_n++] = c;
 
     if (stage == 0) {
         /* Match PROGRAMBT9000U. On a mismatch, retry the current byte as the
