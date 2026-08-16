@@ -63,6 +63,19 @@
  * beep_tone_generate() indexes this via DDS phase accumulator:
  *   idx = (phase_acc >> 24) & 0xFF  (top 8 bits of 32-bit accumulator)
  */
+/* Output volume, 0-100 %.
+ *
+ * The radio's volume knob is an ANALOG POT in the audio path -- there is no ADC
+ * channel for it (the only analog inputs are PA0/PA1, both battery sense), so
+ * the MCU cannot read its position. Software volume is therefore a separate
+ * control: it scales the DAC waveform about its 2048 midpoint before the signal
+ * ever reaches the pot.
+ *
+ * Scaling about the midpoint rather than multiplying the raw sample matters --
+ * the LUT is 2048 + 2047*sin(), so a naive multiply would shift the DC offset
+ * and thump the speaker instead of quietening it. */
+static uint8_t tone_volume = 100;
+
 static const uint16_t sine_lut[SINE_LUT_SIZE] = {
     2048, 2098, 2148, 2198, 2248, 2298, 2348, 2397,
     2447, 2496, 2545, 2594, 2642, 2690, 2737, 2784,
@@ -239,12 +252,39 @@ void dac_audio_play_tone(uint16_t freq_hz_x10)
      */
     {
         uint32_t freq_step = (uint32_t)(((uint64_t)freq_hz_x10 * 4294967296ULL) / 79360);
+
+        /* Quantise so the buffer holds a WHOLE number of sine cycles.
+         *
+         * The DMA buffer is circular and the accumulator restarts at phase 0
+         * every time it is refilled. Unless freq_step * DAC_BUFFER_SAMPLES is
+         * an exact multiple of 2^32, the phase at the end of the buffer does
+         * not line up with the phase at its start -- so every wrap produces a
+         * step discontinuity in the waveform, heard as a click.
+         *
+         * The buffer repeats at 7936 / 2048 = 3.875 Hz, which is exactly the
+         * "about four wobbles a second" this produced.
+         *
+         * Rounding freq_step to a multiple of 2^32 / DAC_BUFFER_SAMPLES = 2^21
+         * makes the ends meet and the loop seamless. The cost is frequency
+         * resolution of 3.875 Hz -- inaudible for beeps, and far preferable to
+         * a click on every wrap. */
+        {
+            const uint32_t quantum = 4294967296ULL / DAC_BUFFER_SAMPLES;  /* 2^21 */
+            uint32_t rounded = ((freq_step + quantum / 2u) / quantum) * quantum;
+            if (rounded == 0u)
+                rounded = quantum;          /* never round a tone away entirely */
+            freq_step = rounded;
+        }
         uint32_t phase_acc = 0;
         int i;
         for (i = 0; i < DAC_BUFFER_SAMPLES; i++) {
             phase_acc += freq_step;
             uint8_t idx = (phase_acc >> 24) & 0xFF;
-            dma_buf[i] = sine_lut[idx];
+            {
+                int32_t v = (int32_t)sine_lut[idx] - 2048;
+                v = (v * (int32_t)tone_volume) / 100;
+                dma_buf[i] = (uint16_t)(2048 + v);
+            }
         }
     }
 
@@ -321,4 +361,17 @@ void dac_audio_play_buffer(const uint16_t *samples, uint16_t count,
 int dac_audio_is_playing(void)
 {
     return (DMA2_CH(3)->CCR & DMA_CCR_EN) ? 1 : 0;
+}
+
+/* Set output volume, 0-100 %. Takes effect on the next tone: the DMA buffer is
+ * filled when a tone starts, so changing this mid-tone does nothing until the
+ * next one. */
+void dac_audio_set_volume(uint8_t percent)
+{
+    tone_volume = (percent > 100u) ? 100u : percent;
+}
+
+uint8_t dac_audio_get_volume(void)
+{
+    return tone_volume;
 }

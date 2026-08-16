@@ -171,6 +171,17 @@ void audio_init(void)
     tone_active = 0;
     tone_end_ms = 0;
     seq_active = 0;
+
+    /* NOTE: dac_audio_init() is deliberately NOT called here.
+     *
+     * The DAC, TIM6 and DMA2 clocks must be up before any tone will sound --
+     * without them every dac_audio_play_tone() writes to dead peripherals and
+     * all three registers read back zero. hw_init() already calls
+     * dac_audio_init() at the right point in the boot order, so the normal
+     * firmware is fine.
+     *
+     * Callers that skip hw_init() -- the HW_TEST builds -- must call
+     * dac_audio_init() themselves before expecting sound. */
 }
 
 void audio_beep(void)

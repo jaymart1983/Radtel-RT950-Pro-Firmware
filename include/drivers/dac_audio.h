@@ -78,6 +78,12 @@ void dac_audio_play_tone(uint16_t freq_hz_x10);
  */
 void dac_audio_stop(void);
 
+/* Output volume, 0-100 %. Scales the DAC waveform about its midpoint.
+ * Independent of the radio's volume knob, which is an analog pot the MCU
+ * cannot read. */
+void dac_audio_set_volume(uint8_t percent);
+uint8_t dac_audio_get_volume(void);
+
 /*
  * dac_audio_play_buffer - Play an arbitrary waveform via DMA.
  * @param samples   Pointer to 12-bit sample buffer
