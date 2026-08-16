@@ -223,18 +223,12 @@ void test_blinky(void)
      * radio down. */
     uint32_t hb = 0;
     while (1) {
-        /* power_button_poll() is DELIBERATELY NOT CALLED.
-         *
-         * Power-off works -- PE0 is detected and releasing the PB9 latch cuts
-         * the supply. But the radio will not come back on afterwards, even with
-         * PB9 asserted in Reset_Handler, which is the earliest instruction the
-         * CPU can execute. That rules out latch timing: the knob is not
-         * restoring power at all, and recovery needs the battery out.
-         *
-         * A power-off that costs a battery pull to undo is worse than none, so
-         * the test builds observe the switch without acting on it. The real
-         * firmware still registers power_button_poll() as a scheduler task; this
-         * only affects HW_TEST. */
+        /* Re-enabled: power_off() now RESETS rather than halting when the
+         * supply does not collapse, matching what Radtel's own RT-900 does.
+         * Previously this loop had to be disabled because a power-off left the
+         * CPU spinning with interrupts off and only a battery pull could
+         * recover it. */
+        power_button_poll();
 
         if ((hb % 25u) == 0u) {
             uint8_t pe0 = (PWR_SWITCH_PORT->IDR & PWR_SWITCH_PIN) ? 1 : 0;

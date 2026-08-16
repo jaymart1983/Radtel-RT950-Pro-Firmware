@@ -361,9 +361,52 @@ void power_off(void)
     /* Release PB9 power latch - hardware regulator cuts power */
     gpio_clear_pin(GPIO_PB9_PWREN_PORT, GPIO_PB9_PWREN_PIN);
 
-    /* Safety: if hardware doesn't cut power, spin with WFI */
-    for (;;)
+    /* Give the regulator time to actually drop the rail. */
+    for (volatile uint32_t i = 0; i < 3000000UL; i++)
+        ;
+
+    /* Still executing? Then the supply did NOT collapse. Wait for the switch,
+     * and reset only when it returns to ON.
+     *
+     * Three behaviours have to be right at once, and only this gets all three:
+     *
+     *   - If the rail really does drop, none of the code below ever runs and
+     *     the radio is genuinely off. Nothing here can cost battery.
+     *   - If the rail stays up, an unconditional NVIC_SystemReset() here would
+     *     boot the radio straight back up: it would never actually turn off and
+     *     would drain the battery. So we do not reset unconditionally.
+     *   - `for (;;) __WFI()` -- what this used to be -- hangs the CPU with
+     *     interrupts disabled. The screen is dark because the backlight is off
+     *     above, so the radio LOOKS off while the CPU is alive and
+     *     unrecoverable. Turning the knob back on does nothing; only pulling
+     *     the battery works. That is exactly the fault being fixed.
+     *
+     * So: sleep in WFI, wake periodically, and watch PE0. It reads LOW when the
+     * switch is ON. When the user turns the knob back on, reset and boot -- the
+     * bootloader then starts the application normally.
+     *
+     * Radtel's RT-900 resets after its power-off too (BoardFun.c
+     * CheckPowerOff: POWER_OFF, DelayMs(500), NVIC_SystemReset(), commented
+     * "reset the system, to avoid powering on immediately after shutdown").
+     * This is the same idea, made conditional so it cannot boot-loop.
+     *
+     * Draw while waiting: RF, PA, backlight and LEDs are all off already, the
+     * core is in WFI most of the time, and this state is only ever reached if
+     * the hardware failed to cut power -- in which case something is drawing
+     * current regardless. */
+    for (;;) {
+        for (volatile uint32_t i = 0; i < 200000UL; i++)
+            ;
+
+        if (!(PWR_SWITCH_PORT->IDR & PWR_SWITCH_PIN)) {
+            /* Switch back ON -- reboot into the application. */
+            __DSB();
+            SCB->AIRCR = SCB_AIRCR_VECTKEY | SCB_AIRCR_SYSRESETREQ;
+            __DSB();
+        }
+
         __WFI();
+    }
 }
 
 /* ========================================================================
