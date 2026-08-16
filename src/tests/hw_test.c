@@ -166,131 +166,62 @@ static void dbg_dec(uint32_t v)
 
 void test_blinky(void)
 {
-    uart_bt_init();
+    /* MINIMAL by design.
+     *
+     * No LCD, no fonts, no colour swatches. The only thing that matters right
+     * now is the ability to reflash a booted radio, and every extra kilobyte
+     * is more image to get corrupted and more variables in the way. Fonts and
+     * geometry can wait until flashing is reliable -- with soft push working,
+     * testing anything else becomes seconds instead of two battery pulls. */
     test_debug_init();
 
-    gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN,
-                    GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    /* Visible state, no fonts.
+     *
+     * Solid colour blocks only: the font table is exactly the sort of late
+     * .rodata that has been landing wrong, so a text-based indicator could
+     * fail for reasons unrelated to what it is reporting. A screen filled with
+     * a flat colour cannot be misread.
+     *
+     *   BLUE   running, waiting for a handshake
+     *   GREEN  handshake seen -- the listener is matching
+     *   RED    handing over to the bootloader
+     */
+    gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
-
     lcd_init();
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x0000);
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x001F);   /* blue = alive */
 
-    /* --- Geometry ---------------------------------------------------
-     * A one-pixel border on all four edges. If any edge is missing or the
-     * frame is cut off, LCD_WIDTH/LCD_HEIGHT (240x320) are wrong, or the
-     * window/rotation setup is. Corner blocks make clipping obvious. */
-    lcd_fill_rect(0, 0, LCD_WIDTH, 1, 0xFFFF);
-    lcd_fill_rect(0, (uint16_t)(LCD_HEIGHT - 1), LCD_WIDTH, 1, 0xFFFF);
-    lcd_fill_rect(0, 0, 1, LCD_HEIGHT, 0xFFFF);
-    lcd_fill_rect((uint16_t)(LCD_WIDTH - 1), 0, 1, LCD_HEIGHT, 0xFFFF);
-    lcd_fill_rect(2, 2, 6, 6, 0xFFFF);
-    lcd_fill_rect((uint16_t)(LCD_WIDTH - 8), 2, 6, 6, 0xFFFF);
-    lcd_fill_rect(2, (uint16_t)(LCD_HEIGHT - 8), 6, 6, 0xFFFF);
-    lcd_fill_rect((uint16_t)(LCD_WIDTH - 8), (uint16_t)(LCD_HEIGHT - 8), 6, 6, 0xFFFF);
+    dbg_println("MIN: minimal flash-capability build");
 
-    /* Built-in 8x8 font from lcd.c -- deliberately NOT app/font.c, whose
-     * glyphs live in external SPI flash and so cannot render before SPI is
-     * up. A bring-up test must not depend on a subsystem it is not testing. */
-    lcd_draw_string(10, 6, "GATE 1: LCD 240x320", 0xFFFF, 0x0000);
-
-    /* --- Colour characterisation ------------------------------------
-     * The first run showed red and blue correct but green as light blue and
-     * yellow as bluish -- so the panel is not interpreting RGB565 the way we
-     * assume. Rather than guess, send each primary AND its byte-swapped twin
-     * and have a human name what they see. Whichever column looks correct
-     * identifies the true pixel format. */
-    struct { const char *label; uint16_t value; } sw[] = {
-        { "R 565", 0xF800 },   /* pure red   if RGB565, LE */
-        { "G 565", 0x07E0 },   /* pure green */
-        { "B 565", 0x001F },   /* pure blue  */
-        { "WHITE", 0xFFFF },
-        { "R SWP", 0x00F8 },   /* same three, byte-swapped */
-        { "G SWP", 0xE007 },
-        { "B SWP", 0x1F00 },
-        { "GREY ", 0x8410 },
-    };
-
-    for (uint8_t i = 0; i < 8; i++) {
-        uint16_t y = (uint16_t)(24 + i * 26);
-        lcd_draw_string(6, (uint16_t)(y + 6), sw[i].label, 0xFFFF, 0x0000);
-        lcd_fill_rect(56, y, (uint16_t)(LCD_WIDTH - 62), 22, sw[i].value);
+    /* Does HANDSHAKE[] read correctly? This is the whole question: the matcher
+     * compares against this array, and it has been reading as garbage because
+     * it sits in the part of the image that never lands. */
+    dbg_puts("HS:");
+    for (uint8_t i = 0; i < update_listener_hs_len(); i++) {
+        dbg_puts(" ");
+        dbg_dec(update_listener_hs_byte(i));
     }
-
-    dbg_println("GATE 1: LCD geometry + colour swatches drawn");
-    dbg_println("GATE 2: this text should also reach the cable");
-
-    /* Liveness and diagnostics go to UART ONLY.
-     *
-     * An earlier revision redrew two status rows on the LCD every second, and
-     * that corrupted text ACROSS THE WHOLE SCREEN -- including the swatch
-     * labels drawn once at boot, which nothing should have touched. Repeated
-     * lcd_set_window/draw cycles are evidently leaving the controller in a
-     * state where later writes land outside their window. That is a real bug
-     * worth chasing, but not while it is also destroying the evidence we are
-     * trying to read.
-     *
-     * UART TX is proven clean, so the LCD is drawn once and then left alone.
-     * Diagnostics do not need it. */
-    /* Flash integrity check.
-     *
-     * Text renders as garbage glyphs while string constants print perfectly
-     * over UART, and HANDSHAKE[] fails to match bytes that arrive correctly.
-     * Both the font table and those strings live in flash, so if one is wrong
-     * and the other is not, what is IN the flash may not be what we built --
-     * a corrupted upload block would do exactly that, damaging whatever
-     * happens to live there while leaving the rest intact.
-     *
-     * Sum the first 8 KB of the application region and print it. The same sum
-     * computed from the .bin offline says whether the flash matches the image.
-     * Deliberately a plain sum: simple enough that the check itself cannot be
-     * the thing that is broken. */
-    {
-        const volatile uint8_t *fw = (const volatile uint8_t *)0x08003000UL;
-        uint32_t sum = 0;
-        for (uint32_t i = 0; i < 8192; i++)
-            sum += fw[i];
-        dbg_puts("FLASH sum[0x08003000..+8192] = ");
-        dbg_dec(sum);
-        dbg_newline();
-    }
-
-    /* Read HANDSHAKE back through the same path the matcher uses. If these
-     * bytes are not 80 82 79 71 ... then the matcher was never given a chance. */
-    {
-        dbg_puts("HANDSHAKE[] as seen by firmware:");
-        for (uint8_t i = 0; i < 14; i++) {
-            dbg_puts(" ");
-            dbg_dec((uint8_t)"PROGRAMBT9000U"[i]);
-        }
-        dbg_newline();
-    }
-
-    dbg_println("GATE 1 drawn. Diagnostics on UART only.");
-    dbg_println("Send PROGRAMBT9000U to test RX.");
+    dbg_newline();
+    dbg_println("ok: 80 82 79 71 82 65 77 66 84 57 48 48 48 85");
 
     uint32_t count = 0;
+    uint8_t  was_matching = 0;
     while (1) {
-        dbg_puts("count ");
-        dbg_dec(count++);
-        dbg_puts("  rx=");
-        dbg_dec(update_listener_rx_count());
-        dbg_puts(" stage=");
-        dbg_dec(update_listener_stage());
-        dbg_puts(" match=");
-        dbg_dec(update_listener_matched());
-        dbg_newline();
-
-        if (update_listener_cap_count()) {
-            dbg_puts("  rxbytes:");
-            for (uint8_t bi = 0; bi < update_listener_cap_count(); bi++) {
-                dbg_puts(" ");
-                dbg_dec(update_listener_cap_byte(bi));
-            }
-            dbg_newline();
-            dbg_println("  expect:  80 82 79 71 82 65 77 66 84 57 48 48 48 85");
+        /* Turn green the moment the matcher starts advancing, so progress is
+         * visible on the radio without needing the cable. */
+        uint8_t m = update_listener_matched();
+        if (m && !was_matching) {
+            lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x07E0);   /* green */
+            was_matching = 1;
         }
 
+        dbg_puts("alive ");
+        dbg_dec(count++);
+        dbg_puts(" rx=");
+        dbg_dec(update_listener_rx_count());
+        dbg_puts(" match=");
+        dbg_dec(m);
+        dbg_newline();
         delay_ms(1000);
     }
 }

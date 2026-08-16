@@ -279,6 +279,13 @@ class FirmwareUploader:
         finally:
             self.ser.timeout = old_timeout
 
+    def _send_paced(self, data: bytes, gap: float = 0.02):
+        """Send one byte at a time with a gap, so the radio's matcher keeps up."""
+        for b in data:
+            self.ser.write(bytes([b]))
+            self.ser.flush()
+            time.sleep(gap)
+
     def _wait_ack(self, what: str, timeout: float = 3.0) -> bool:
         """Scan the incoming stream for an ACK rather than demanding it first.
 
@@ -323,10 +330,20 @@ class FirmwareUploader:
         # What actually matters is whether the bootloader is now listening, and
         # probe() already establishes that. So send the sequence, report what
         # came back, and let the probe decide.
-        self.send_raw(HANDSHAKE_STRING)
+        # Send the trigger strings PACED, one byte at a time.
+        #
+        # A back-to-back burst is not reliably matched: the radio counts every
+        # byte (rx increments correctly) but the matcher sees gaps, because the
+        # application is busy driving the bit-banged LCD and bytes coalesce at
+        # the UART before the handler observes them in order. Sent ~20 ms apart
+        # the same sequence matches every time.
+        #
+        # 14 + 6 bytes at 20 ms is under half a second, which is nothing next to
+        # a firmware upload, so there is no reason to be clever about it.
+        self._send_paced(HANDSHAKE_STRING)
         got_hs = self._wait_ack("Handshake", timeout=2.0)
 
-        self.send_raw(UPDATE_STRING)
+        self._send_paced(UPDATE_STRING)
         got_up = self._wait_ack("UPDATE", timeout=2.0)
 
         if not (got_hs and got_up):

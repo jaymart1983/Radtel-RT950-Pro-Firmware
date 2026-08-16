@@ -10,6 +10,7 @@
 
 #include "at32f403a.h"
 #include "debug_uart.h"
+#include "drivers/lcd.h"
 
 /* Host handshake, byte for byte as firmware_upload.py sends it. */
 static const char HANDSHAKE[] = "PROGRAMBT9000U";
@@ -56,6 +57,16 @@ static volatile uint8_t  rx_cap[RX_CAP];
 static volatile uint8_t  rx_cap_n;
 
 uint8_t update_listener_cap_count(void) { return rx_cap_n; }
+
+/* Read HANDSHAKE[] through the SAME symbol the matcher uses. Printing the
+ * string literal from another translation unit proves nothing about this
+ * array -- and 'P' matching while 'R' does not says this array is not what
+ * the source appears to say. */
+uint8_t update_listener_hs_byte(uint8_t i)
+{
+    return (i < HANDSHAKE_LEN) ? (uint8_t)HANDSHAKE[i] : 0;
+}
+uint8_t update_listener_hs_len(void) { return (uint8_t)HANDSHAKE_LEN; }
 uint8_t update_listener_cap_byte(uint8_t i)
 {
     return (i < RX_CAP) ? rx_cap[i] : 0;
@@ -134,69 +145,82 @@ void update_listener_init(void)
 
 void update_listener_enter_bootloader(void)
 {
-    dbg_puts("[UPD] handing over to bootloader update mode\n");
+    dbg_puts("[UPD] entering bootloader update mode\n");
+
+    /* Flag the handover on screen before anything else -- if the radio dies
+     * during the jump, the colour says how far it got. */
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0xF800);   /* red */
 
     __asm volatile ("cpsid i");
 
-    /* Drive both button pins low as push-pull outputs. This is the whole
-     * trick: we are about to BRANCH to the bootloader rather than reset, so
-     * this pin state survives into its button check. A reset would clear it. */
-    CRM->APB2EN |= CRM_APB2EN_IOPAEN | CRM_APB2EN_IOPEEN;
+    /* Call the bootloader's UART update mode DIRECTLY, rather than driving the
+     * side-button pins low and branching to its reset vector.
+     *
+     * The pin trick does not work: the listener matches, both ACKs go out, and
+     * then the bootloader boots the application again instead of staying in
+     * update mode -- its own gpio_init() runs before the button check and takes
+     * those pins back, so whatever we drove is gone by the time it looks.
+     *
+     * Entering uart_update_mode() directly skips the button test altogether.
+     * Doing so means the bootloader's own startup has not run, so its .data
+     * must be placed by hand first -- addresses from the bootloader's init
+     * table at 0x08002CB4 (see docs/bootloader.md):
+     *
+     *     0x34  bytes from flash 0x08002D68 -> SRAM 0x20000000   (.data)
+     *     0x884 bytes from flash 0x08002D9C -> SRAM 0x20000034   (.bss init)
+     *
+     * The bootloader region is never rewritten by an application upload, so
+     * these addresses are stable. If this is wrong the radio hangs and the side
+     * buttons still recover it -- the same safety net as before. */
 
-    {   /* PE5 -> output push-pull, 2 MHz. CRL bits [23:20]. */
-        volatile uint32_t *crl = &GPIOE->CRL;
-        uint32_t v = *crl;
-        v &= ~(0xFUL << 20);
-        v |=  (0x2UL << 20);          /* cnf 00 (PP), mode 10 (2 MHz) */
-        *crl = v;
-        GPIOE->CLR = UPD_PIN_E5;      /* drive low */
-    }
-    {   /* PA12 -> output push-pull, 2 MHz. CRH bits [19:16]. */
-        volatile uint32_t *crh = &GPIOA->CRH;
-        uint32_t v = *crh;
-        v &= ~(0xFUL << 16);
-        v |=  (0x2UL << 16);
-        *crh = v;
-        GPIOA->CLR = UPD_PIN_A12;     /* drive low */
-    }
-
-    /* Let the levels settle; the bootloader debounces by sampling twice. */
-    for (volatile uint32_t i = 0; i < 100000UL; i++)
-        ;
-
-    /* Put the machine back the way the bootloader expects to find it. */
-    UART4->CR1 = 0;                                    /* silence our UART use */
-    *(volatile uint32_t *)0xE000E180UL = 0xFFFFFFFFUL; /* NVIC ICER0: disable */
-    *(volatile uint32_t *)0xE000E184UL = 0xFFFFFFFFUL; /* ICER1 */
-    *(volatile uint32_t *)0xE000E188UL = 0xFFFFFFFFUL; /* ICER2 */
-    *(volatile uint32_t *)0xE000E280UL = 0xFFFFFFFFUL; /* ICPR0: clear pending */
+    /* Peripherals we have been using must be quiet before handing over. */
+    UART4->CR1 = 0;
+    *(volatile uint32_t *)0xE000E180UL = 0xFFFFFFFFUL;   /* NVIC ICER0 */
+    *(volatile uint32_t *)0xE000E184UL = 0xFFFFFFFFUL;
+    *(volatile uint32_t *)0xE000E188UL = 0xFFFFFFFFUL;
+    *(volatile uint32_t *)0xE000E280UL = 0xFFFFFFFFUL;   /* ICPR0 */
     *(volatile uint32_t *)0xE000E284UL = 0xFFFFFFFFUL;
     *(volatile uint32_t *)0xE000E288UL = 0xFFFFFFFFUL;
     SysTick->CTRL = 0;
+
+    /* Recreate the bootloader's initialised data. */
+    {
+        const volatile uint8_t *src = (const volatile uint8_t *)0x08002D68UL;
+        volatile uint8_t *dst = (volatile uint8_t *)0x20000000UL;
+        for (uint32_t i = 0; i < 0x34UL; i++) dst[i] = src[i];
+
+        src = (const volatile uint8_t *)0x08002D9CUL;
+        dst = (volatile uint8_t *)0x20000034UL;
+        for (uint32_t i = 0; i < 0x884UL; i++) dst[i] = src[i];
+    }
+
     SCB->VTOR = BOOTLOADER_BASE;
+    __asm volatile ("msr msp, %0" : : "r" (*(volatile uint32_t *)BOOTLOADER_BASE));
 
-    uint32_t boot_sp    = *(volatile uint32_t *)(BOOTLOADER_BASE + 0);
-    uint32_t boot_reset = *(volatile uint32_t *)(BOOTLOADER_BASE + 4);
+    /* Call as little of the bootloader as possible.
+     *
+     * The first attempt replicated its main() -- gpio_init, "lcd_init",
+     * uart_init -- and died partway: the screen went black (so bootloader code
+     * really did run) but the update loop never drew its UPDATE banner. One of
+     * those calls was also plain wrong: 0x080003F8 is lcd_gpio_init, not the
+     * ST7789 init at 0x08001588, which the doc's prose and its own function
+     * table disagree about.
+     *
+     * uart_update_mode() needs the UART, and the UART is already configured at
+     * 115200 by us. gpio_init and the LCD are irrelevant to a serial update.
+     * So call only uart_init -- to let the bootloader set the UART up its own
+     * way -- and then the update loop. Fewer calls, fewer guessed addresses,
+     * fewer ways to be wrong. */
+    ((void (*)(void))(0x0800214CUL | 1UL))();   /* uart_init */
 
-    __asm volatile (
-        "msr msp, %0\n"
-        "bx  %1\n"
-        :
-        : "r" (boot_sp), "r" (boot_reset)
-        : "memory"
-    );
+    __asm volatile ("cpsie i");
 
-    /* bx above does not return. */
+    ((void (*)(void))(0x08000224UL | 1UL))();   /* uart_update_mode, no return */
+
     for (;;)
         ;
 }
 
-/* Fed one byte at a time from UART4_IRQHandler in drivers/uart.c.
- *
- * The driver owns that ISR and buffers bytes for CPS; this only inspects them
- * on the way past. Deliberately NOT a second ISR -- two definitions of
- * UART4_IRQHandler do not link, and more importantly the handshake has to be
- * seen even in builds where CPS never drains the ring buffer. */
 void update_listener_feed(uint8_t c)
 {
     rx_count++;

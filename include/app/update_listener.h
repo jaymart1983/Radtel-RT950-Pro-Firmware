@@ -60,6 +60,8 @@
 #define update_listener_matched()       (0)
 #define update_listener_cap_count()     (0)
 #define update_listener_cap_byte(i)     ((void)(i), 0)
+#define update_listener_hs_byte(i)      ((void)(i), 0)
+#define update_listener_hs_len()        (0)
 #else
 
 /* Arm the listener. Call as early as possible -- before hw_init() -- so a
@@ -79,6 +81,8 @@ uint8_t  update_listener_stage(void);
 uint8_t  update_listener_matched(void);
 uint8_t  update_listener_cap_count(void);
 uint8_t  update_listener_cap_byte(uint8_t i);
+uint8_t  update_listener_hs_byte(uint8_t i);
+uint8_t  update_listener_hs_len(void);
 
 /* Non-zero once the full handshake has been seen. Mostly for diagnostics --
  * the handover happens inside the ISR, so this rarely gets observed. */
