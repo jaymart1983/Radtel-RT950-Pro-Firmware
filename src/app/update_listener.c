@@ -5,6 +5,9 @@
  */
 
 #include "app/update_listener.h"
+
+#ifndef NO_UPDATE_LISTENER
+
 #include "at32f403a.h"
 #include "debug_uart.h"
 
@@ -75,14 +78,26 @@ void update_listener_init(void)
      * nothing else has configured this UART yet. */
     UART4->BRR = 521;
 
+    /* Clear any stale receive state BEFORE enabling the interrupt.
+     *
+     * The bootloader has just finished an upload over this same UART, so the
+     * overrun flag is very likely set and a byte may be sitting in DR. Enabling
+     * RXNEIE on top of that immediately storms the ISR. Reading SR then DR
+     * clears ORE/FE/NE/PE and empties the register. */
+    (void)UART4->SR;
+    (void)UART4->DR;
+
     /* Keep whatever TX configuration is already present (the debug UART sets
      * TE|UE) and add RX plus the RX-not-empty interrupt. uart_cps_init() may
      * later overwrite CR1 wholesale, but it sets the same RX bits, so the
      * listener keeps working either way. */
     UART4->CR1 |= USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;
 
-    /* Enable UART4 in the NVIC (ISER, one bit per IRQ; writes of 0 are
-     * ignored, so this cannot disturb other enabled interrupts). */
+    /* Drop any interrupt that went pending while we were setting up, then
+     * enable. ICPR/ISER are one bit per IRQ and ignore zero writes, so neither
+     * disturbs other interrupts. */
+    *(volatile uint32_t *)(0xE000E280UL + (UART4_IRQn / 32) * 4UL)
+        = (1UL << (UART4_IRQn % 32));
     *(volatile uint32_t *)(0xE000E100UL + (UART4_IRQn / 32) * 4UL)
         = (1UL << (UART4_IRQn % 32));
 
@@ -192,3 +207,5 @@ void update_listener_feed(uint8_t c)
         }
     }
 }
+
+#endif /* NO_UPDATE_LISTENER */

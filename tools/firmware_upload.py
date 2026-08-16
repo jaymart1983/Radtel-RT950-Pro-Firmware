@@ -279,27 +279,48 @@ class FirmwareUploader:
         finally:
             self.ser.timeout = old_timeout
 
+    def _wait_ack(self, what: str, timeout: float = 3.0) -> bool:
+        """Scan the incoming stream for an ACK rather than demanding it first.
+
+        A running radio may be emitting debug output on this same UART, so the
+        byte immediately after the handshake is frequently unrelated. Requiring
+        resp[0] == ACK made a perfectly good handshake look like a failure --
+        the reported "got: b6" was simply the first byte of a debug line.
+        """
+        deadline = time.time() + timeout
+        seen = bytearray()
+        while time.time() < deadline:
+            chunk = self.recv_raw(64, timeout=0.3)
+            if chunk:
+                seen.extend(chunk)
+                if ACK_BYTE in chunk:
+                    if len(seen) > 1:
+                        print(f"  {what} ACK found after {len(seen) - 1} bytes "
+                              f"of other output (debug traffic on the same UART)")
+                    else:
+                        print(f"  {what} ACK received")
+                    return True
+        print(f"  ERROR: No ACK to {what} "
+              f"(saw: {bytes(seen[:24]).hex() if seen else 'nothing'})")
+        return False
+
     def handshake(self) -> bool:
         """Phase 1: PROGRAMBT9000U + UPDATE handshake."""
         print("Phase 1: Entering update mode...")
 
-        # Step 1: Send handshake string
+        # Clear anything already buffered, so a debug line sent before we
+        # started is not mistaken for a reply.
+        self.ser.reset_input_buffer()
+
         self.send_raw(HANDSHAKE_STRING)
-
-        resp = self.recv_raw(1, timeout=3.0)
-        if not resp or resp[0] != ACK_BYTE:
-            print(f"  ERROR: No ACK to handshake (got: {resp.hex() if resp else 'nothing'})")
+        if not self._wait_ack("Handshake"):
             return False
-        print("  Handshake ACK received")
 
-        # Step 2: Send UPDATE command - MCU will ACK then reset
         self.send_raw(UPDATE_STRING)
-
-        resp = self.recv_raw(1, timeout=3.0)
-        if not resp or resp[0] != ACK_BYTE:
-            print(f"  ERROR: No ACK to UPDATE (got: {resp.hex() if resp else 'nothing'})")
+        if not self._wait_ack("UPDATE"):
             return False
-        print("  UPDATE ACK received - radio entering bootloader mode")
+
+        print("  Radio entering bootloader mode")
         return True
 
     def send_command(self, cmd: int, args: int = 0, data: bytes = b"",

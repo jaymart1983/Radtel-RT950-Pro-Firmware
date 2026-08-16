@@ -283,6 +283,13 @@ typedef struct {
 #define UART5       ((USART_TypeDef *)UART5_BASE)
 
 /* USART SR bits */
+#define USART_SR_PE     (1UL << 0)   /* parity error */
+#define USART_SR_FE     (1UL << 1)   /* framing error */
+#define USART_SR_NE     (1UL << 2)   /* noise error */
+#define USART_SR_ORE    (1UL << 3)   /* overrun -- MUST be cleared by
+                                      * reading SR then DR, or an RXNE-only
+                                      * ISR spins forever re-entering */
+#define USART_SR_IDLE   (1UL << 4)
 #define USART_SR_RXNE   (1UL << 5)
 #define USART_SR_TC     (1UL << 6)
 #define USART_SR_TXE    (1UL << 7)

@@ -48,6 +48,14 @@
 
 #include <stdint.h>
 
+#ifdef NO_UPDATE_LISTENER
+/* Control build (make NOLISTENER=1): compile the listener out entirely so it
+ * can be ruled in or out as the cause of a boot failure. */
+#define update_listener_init()          ((void)0)
+#define update_listener_feed(c)         ((void)(c))
+#define update_listener_triggered()     (0)
+#else
+
 /* Arm the listener. Call as early as possible -- before hw_init() -- so a
  * later failure cannot stop it being armed. Enables UART4 RX + RXNE interrupt.
  * Safe to call when the debug UART is in use: debug output is TX-only on PC10,
@@ -65,5 +73,7 @@ uint8_t update_listener_triggered(void);
 /* Hand over to the bootloader's UART update mode. Does not return.
  * Exposed so a menu entry or a key combination can trigger it too. */
 void update_listener_enter_bootloader(void) __attribute__((noreturn));
+
+#endif /* NO_UPDATE_LISTENER */
 
 #endif /* APP_UPDATE_LISTENER_H */

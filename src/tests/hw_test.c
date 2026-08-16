@@ -2,7 +2,15 @@
  * hw_test.c - Hardware test suite for RT-950 Pro bring-up
  *
  * Each test is standalone and exercises one peripheral subsystem.
- * Output goes to USART1 (Bluetooth/debug port) at 115200 baud.
+ *
+ * Output goes to UART4 (PC10/PC11) at 115200 baud -- the programming cable.
+ *
+ * These helpers used to write to USART1, the Bluetooth port, which is NOT
+ * connected to the programming cable. Every test printed diagnostics that
+ * nothing could receive, so the whole suite looked mute on a bench setup and
+ * a working test was indistinguishable from a dead radio. They deliberately
+ * shadow the global dbg_* from debug_uart.h, so the mistake was invisible at
+ * the call sites.
  *
  * Build with:  make test TEST=N
  * Flash via:   tools/encrypt_btf.py to create flashable BTF
@@ -21,6 +29,7 @@
 #include "drivers/dac_audio.h"
 #include "drivers/lcd.h"
 #include "app/display.h"
+#include "app/font.h"
 #include "app/keypad.h"
 #include "app/encoder.h"
 #include "app/gps.h"
@@ -28,18 +37,84 @@
 extern void delay_ms(uint32_t ms);
 extern uint32_t get_tick(void);
 
+/* Bring up UART4 for test output. dbg_init() only runs in DEBUG builds, so the
+ * tests cannot rely on it; uart_cps_init() configures the same peripheral at
+ * 115200 either way. Safe to call twice. */
+static void test_debug_init(void)
+{
+    uart_acc_init();   /* UART4 on PC10/PC11 -- the programming cable */
+}
+
+
+/* ---------------------------------------------------------------------------
+ * On-screen debug console
+ *
+ * Mirrors every debug line to the LCD as well as the UART. The point is to
+ * make the firmware's INTENT observable without depending on the serial link:
+ * if the screen shows the counter climbing but the cable stays silent, the
+ * fault is isolated to UART TX and the firmware is fine. Without this, a mute
+ * cable and a dead radio look identical -- which has already cost several
+ * test cycles.
+ * ------------------------------------------------------------------------- */
+
+#define CON_ROWS      18
+#define CON_ROW_H     12
+#define CON_TOP       84          /* below the colour bars */
+#define CON_COLS      38
+
+static char     con_line[CON_COLS + 1];
+static uint8_t  con_pos;
+static uint8_t  con_row;
+static uint8_t  con_ready;        /* only draw once lcd_init() has run */
+
+static void con_enable(void)   __attribute__((unused));
+static void con_enable(void)   { con_ready = 1; con_row = 0; con_pos = 0; }
+
+static void con_flush(void)
+{
+    if (!con_ready) { con_pos = 0; return; }
+    con_line[con_pos] = '\0';
+
+    /* Wrap by wiping the console area, so old text never overlaps new. */
+    if (con_row >= CON_ROWS) {
+        con_row = 0;
+        lcd_fill_rect(0, CON_TOP, LCD_WIDTH,
+                      (uint16_t)(CON_ROWS * CON_ROW_H), COLOR_BLACK);
+    }
+
+    /* Clear this row first: shorter lines would otherwise leave a tail. */
+    lcd_fill_rect(0, (uint16_t)(CON_TOP + con_row * CON_ROW_H),
+                  LCD_WIDTH, CON_ROW_H, COLOR_BLACK);
+    font_draw_string(FONT_SMALL, 2,
+                     (uint16_t)(CON_TOP + con_row * CON_ROW_H),
+                     con_line, COLOR_WHITE, COLOR_BLACK);
+    con_row++;
+    con_pos = 0;
+}
+
+static void con_putc(char c)
+{
+    if (c == '\n') { con_flush(); return; }
+    if (c == '\r') return;
+    if (con_pos < CON_COLS) con_line[con_pos++] = c;
+}
+
 /* Debug output helpers ------------------------------------------------ */
 
 static void dbg_puts(const char *s)
 {
-    while (*s)
-        uart_send_byte(USART1, (uint8_t)*s++);
+    while (*s) {
+        uart_send_byte(UART4, (uint8_t)*s);
+        con_putc(*s);
+        s++;
+    }
 }
 
 static void dbg_newline(void)
 {
-    uart_send_byte(USART1, '\r');
-    uart_send_byte(USART1, '\n');
+    uart_send_byte(UART4, '\r');
+    uart_send_byte(UART4, '\n');
+    con_flush();
 }
 
 static void dbg_println(const char *s)
@@ -51,8 +126,10 @@ static void dbg_println(const char *s)
 static void dbg_hex8(uint8_t v)
 {
     static const char hex[] = "0123456789ABCDEF";
-    uart_send_byte(USART1, hex[v >> 4]);
-    uart_send_byte(USART1, hex[v & 0xF]);
+    uart_send_byte(UART4, hex[v >> 4]);
+    uart_send_byte(UART4, hex[v & 0xF]);
+    con_putc(hex[v >> 4]);
+    con_putc(hex[v & 0xF]);
 }
 
 static void dbg_hex16(uint16_t v)
@@ -66,15 +143,19 @@ static void dbg_dec(uint32_t v)
     char buf[12];
     int i = 0;
     if (v == 0) {
-        uart_send_byte(USART1, '0');
+        uart_send_byte(UART4, '0');
+        con_putc('0');
         return;
     }
     while (v > 0) {
         buf[i++] = '0' + (char)(v % 10);
         v /= 10;
     }
-    while (i > 0)
-        uart_send_byte(USART1, (uint8_t)buf[--i]);
+    while (i > 0) {
+        char c = buf[--i];
+        uart_send_byte(UART4, (uint8_t)c);
+        con_putc(c);
+    }
 }
 
 /* ==========================================================================
@@ -85,24 +166,82 @@ static void dbg_dec(uint32_t v)
 void test_blinky(void)
 {
     uart_bt_init();
-    dbg_println("=== TEST 1: Blinky (LCD backlight PC6) ===");
+    test_debug_init();
 
     gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN,
                     GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
+    gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
 
+    lcd_init();
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x0000);
+
+    /* --- Geometry ---------------------------------------------------
+     * A one-pixel border on all four edges. If any edge is missing or the
+     * frame is cut off, LCD_WIDTH/LCD_HEIGHT (240x320) are wrong, or the
+     * window/rotation setup is. Corner blocks make clipping obvious. */
+    lcd_fill_rect(0, 0, LCD_WIDTH, 1, 0xFFFF);
+    lcd_fill_rect(0, (uint16_t)(LCD_HEIGHT - 1), LCD_WIDTH, 1, 0xFFFF);
+    lcd_fill_rect(0, 0, 1, LCD_HEIGHT, 0xFFFF);
+    lcd_fill_rect((uint16_t)(LCD_WIDTH - 1), 0, 1, LCD_HEIGHT, 0xFFFF);
+    lcd_fill_rect(2, 2, 6, 6, 0xFFFF);
+    lcd_fill_rect((uint16_t)(LCD_WIDTH - 8), 2, 6, 6, 0xFFFF);
+    lcd_fill_rect(2, (uint16_t)(LCD_HEIGHT - 8), 6, 6, 0xFFFF);
+    lcd_fill_rect((uint16_t)(LCD_WIDTH - 8), (uint16_t)(LCD_HEIGHT - 8), 6, 6, 0xFFFF);
+
+    /* Built-in 8x8 font from lcd.c -- deliberately NOT app/font.c, whose
+     * glyphs live in external SPI flash and so cannot render before SPI is
+     * up. A bring-up test must not depend on a subsystem it is not testing. */
+    lcd_draw_string(10, 6, "GATE 1: LCD 240x320", 0xFFFF, 0x0000);
+
+    /* --- Colour characterisation ------------------------------------
+     * The first run showed red and blue correct but green as light blue and
+     * yellow as bluish -- so the panel is not interpreting RGB565 the way we
+     * assume. Rather than guess, send each primary AND its byte-swapped twin
+     * and have a human name what they see. Whichever column looks correct
+     * identifies the true pixel format. */
+    struct { const char *label; uint16_t value; } sw[] = {
+        { "R 565", 0xF800 },   /* pure red   if RGB565, LE */
+        { "G 565", 0x07E0 },   /* pure green */
+        { "B 565", 0x001F },   /* pure blue  */
+        { "WHITE", 0xFFFF },
+        { "R SWP", 0x00F8 },   /* same three, byte-swapped */
+        { "G SWP", 0xE007 },
+        { "B SWP", 0x1F00 },
+        { "GREY ", 0x8410 },
+    };
+
+    for (uint8_t i = 0; i < 8; i++) {
+        uint16_t y = (uint16_t)(24 + i * 26);
+        lcd_draw_string(6, (uint16_t)(y + 6), sw[i].label, 0xFFFF, 0x0000);
+        lcd_fill_rect(56, y, (uint16_t)(LCD_WIDTH - 62), 22, sw[i].value);
+    }
+
+    dbg_println("GATE 1: LCD geometry + colour swatches drawn");
+    dbg_println("GATE 2: this text should also reach the cable");
+
+    /* Liveness: a number climbing on screen once a second. Unlike a flashing
+     * backlight, this cannot be confused with a reset loop. */
     uint32_t count = 0;
     while (1) {
-        gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
-        dbg_puts("ON  #");
-        dbg_dec(count++);
-        dbg_newline();
-        delay_ms(500);
+        char buf[24];
+        const char *p = "count ";
+        uint8_t n = 0;
+        while (*p) buf[n++] = *p++;
+        uint32_t v = count;
+        char tmp[12]; int t = 0;
+        if (v == 0) tmp[t++] = '0';
+        while (v) { tmp[t++] = (char)('0' + (v % 10)); v /= 10; }
+        while (t) buf[n++] = tmp[--t];
+        buf[n++] = ' '; buf[n] = '\0';
 
-        gpio_clear_pin(LCD_BL_PORT, LCD_BL_PIN);
-        dbg_puts("OFF #");
-        dbg_dec(count++);
+        lcd_draw_string(56, (uint16_t)(LCD_HEIGHT - 22), buf, 0xFFFF, 0x0000);
+
+        dbg_puts("count ");
+        dbg_dec(count);
         dbg_newline();
-        delay_ms(500);
+
+        count++;
+        delay_ms(1000);
     }
 }
 
@@ -114,6 +253,7 @@ void test_blinky(void)
 void test_uart_echo(void)
 {
     uart_bt_init();
+    test_debug_init();
     uart_gps_init();
     dbg_println("=== TEST 2: UART Echo ===");
     dbg_println("BT(USART1): echo mode  |  GPS(USART3): passthrough to BT");
@@ -122,12 +262,12 @@ void test_uart_echo(void)
         /* Echo BT input */
         if (uart_bt_rx_available()) {
             uint8_t c = uart_bt_rx_read();
-            uart_send_byte(USART1, c);
+            uart_send_byte(UART4, c);
         }
         /* Forward GPS to BT */
         if (gps_rx_available()) {
             uint8_t c = gps_rx_read();
-            uart_send_byte(USART1, c);
+            uart_send_byte(UART4, c);
         }
     }
 }
@@ -140,6 +280,7 @@ void test_uart_echo(void)
 void test_lcd_pattern(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 3: LCD Test Pattern ===");
 
     /* LCD backlight on */
@@ -183,6 +324,7 @@ void test_lcd_pattern(void)
 void test_bk4829_id(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 4: BK4829 Chip ID ===");
 
     bk4829_init(BK4829_CHIP0);
@@ -220,6 +362,7 @@ void test_bk4829_id(void)
 void test_si4732_rev(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 5: SI4732 Revision ===");
 
     si4732_init();
@@ -274,6 +417,7 @@ void test_si4732_rev(void)
 void test_spi_flash_id(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 6: SPI Flash JEDEC ID ===");
 
     spi2_init();
@@ -326,6 +470,7 @@ void test_spi_flash_id(void)
 void test_adc_monitor(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 7: ADC Monitor ===");
 
     adc_init();
@@ -359,6 +504,7 @@ void test_adc_monitor(void)
 void test_dac_tone(void)
 {
     uart_bt_init();
+    test_debug_init();
     dma_init();
     dbg_println("=== TEST 8: DAC 1kHz Tone on PA4 ===");
 
@@ -397,6 +543,7 @@ void test_dac_tone(void)
 void test_keypad_encoder(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("=== TEST 9: Keypad + Encoder ===");
     dbg_println("Press keys or turn encoder. Output on USART1.");
 
@@ -451,6 +598,7 @@ void test_keypad_encoder(void)
 void test_gps_display(void)
 {
     uart_bt_init();
+    test_debug_init();
     uart_gps_init();
     dbg_println("=== TEST 10: GPS NMEA Display ===");
     dbg_println("Raw NMEA forwarded to USART1. Parsed data every 2s.");
@@ -462,7 +610,7 @@ void test_gps_display(void)
         /* Forward raw NMEA bytes to debug port */
         if (gps_rx_available()) {
             uint8_t c = gps_rx_read();
-            uart_send_byte(USART1, c);
+            uart_send_byte(UART4, c);
         }
 
         /* Periodic parsed data dump */
@@ -497,6 +645,7 @@ void test_gps_display(void)
 void test_full_diagnostic(void)
 {
     uart_bt_init();
+    test_debug_init();
     dbg_println("========================================");
     dbg_println("  RT-950 Pro Custom Firmware Diagnostic");
     dbg_println("  Build: " __DATE__ " " __TIME__);

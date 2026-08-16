@@ -131,6 +131,12 @@ endif
 ifdef DEBUG
 CFLAGS += -DDEBUG_UART
 endif
+
+# Build without the soft update listener: make NOLISTENER=1
+# Useful as a control when isolating whether the listener itself is at fault.
+ifdef NOLISTENER
+CFLAGS += -DNO_UPDATE_LISTENER
+endif
 test:
 ifndef TEST
 	@echo "Usage: make test TEST=N"

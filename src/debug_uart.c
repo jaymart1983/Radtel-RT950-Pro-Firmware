@@ -47,6 +47,12 @@ void dbg_init(void)
     val |=  (0x4UL << 12);  /* 0x4 = cnf:01 mode:00 */
     *crh = val;
 
+    /* Clear framing config left over from the bootloader, which has just been
+     * using this UART for the firmware upload. Leaving CR2/CR3 alone produced
+     * consistently corrupted bytes that looked like a baud error. */
+    UART4->CR2 = 0;
+    UART4->CR3 = 0;
+
     /* 115200 baud: APB1 = 60 MHz, BRR = 60000000/115200 = 521 */
     UART4->BRR = 521;
     /* Enable UART, TX only (no RX, no interrupts) */
