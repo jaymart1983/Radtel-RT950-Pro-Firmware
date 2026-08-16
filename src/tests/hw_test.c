@@ -189,9 +189,9 @@ void test_blinky(void)
     gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
     lcd_init();
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x001F);   /* blue = alive */
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0xFFE0);   /* YELLOW = v2 */
 
-    dbg_println("MIN: minimal flash-capability build");
+    dbg_println("MIN v2: ZERO-TOUCH UPDATE PROOF");
 
     /* Does HANDSHAKE[] read correctly? This is the whole question: the matcher
      * compares against this array, and it has been reading as garbage because

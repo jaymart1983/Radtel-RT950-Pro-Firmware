@@ -53,6 +53,7 @@ SRCS = \
 	$(SRC_DIR)/app/zone_browser.c \
 	$(SRC_DIR)/app/zone_filter.c \
 	$(SRC_DIR)/app/update_listener.c \
+	$(SRC_DIR)/app/updater.c \
 	$(SRC_DIR)/app/channel_picker.c \
 	$(SRC_DIR)/app/bluetooth.c \
 	$(SRC_DIR)/app/noaa.c \

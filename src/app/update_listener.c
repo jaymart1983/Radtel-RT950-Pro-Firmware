@@ -11,6 +11,7 @@
 #include "at32f403a.h"
 #include "debug_uart.h"
 #include "drivers/lcd.h"
+#include "app/updater.h"
 
 /* Host handshake, byte for byte as firmware_upload.py sends it. */
 static const char HANDSHAKE[] = "PROGRAMBT9000U";
@@ -145,80 +146,17 @@ void update_listener_init(void)
 
 void update_listener_enter_bootloader(void)
 {
-    dbg_puts("[UPD] entering bootloader update mode\n");
+    dbg_puts("[UPD] entering in-app updater\n");
 
-    /* Flag the handover on screen before anything else -- if the radio dies
-     * during the jump, the colour says how far it got. */
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0xF800);   /* red */
+    /* Red: handing over. Drawn before anything else so a hang still leaves a
+     * visible marker of how far we got. */
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0xF800);
 
-    __asm volatile ("cpsid i");
-
-    /* Call the bootloader's UART update mode DIRECTLY, rather than driving the
-     * side-button pins low and branching to its reset vector.
-     *
-     * The pin trick does not work: the listener matches, both ACKs go out, and
-     * then the bootloader boots the application again instead of staying in
-     * update mode -- its own gpio_init() runs before the button check and takes
-     * those pins back, so whatever we drove is gone by the time it looks.
-     *
-     * Entering uart_update_mode() directly skips the button test altogether.
-     * Doing so means the bootloader's own startup has not run, so its .data
-     * must be placed by hand first -- addresses from the bootloader's init
-     * table at 0x08002CB4 (see docs/bootloader.md):
-     *
-     *     0x34  bytes from flash 0x08002D68 -> SRAM 0x20000000   (.data)
-     *     0x884 bytes from flash 0x08002D9C -> SRAM 0x20000034   (.bss init)
-     *
-     * The bootloader region is never rewritten by an application upload, so
-     * these addresses are stable. If this is wrong the radio hangs and the side
-     * buttons still recover it -- the same safety net as before. */
-
-    /* Peripherals we have been using must be quiet before handing over. */
-    UART4->CR1 = 0;
-    *(volatile uint32_t *)0xE000E180UL = 0xFFFFFFFFUL;   /* NVIC ICER0 */
-    *(volatile uint32_t *)0xE000E184UL = 0xFFFFFFFFUL;
-    *(volatile uint32_t *)0xE000E188UL = 0xFFFFFFFFUL;
-    *(volatile uint32_t *)0xE000E280UL = 0xFFFFFFFFUL;   /* ICPR0 */
-    *(volatile uint32_t *)0xE000E284UL = 0xFFFFFFFFUL;
-    *(volatile uint32_t *)0xE000E288UL = 0xFFFFFFFFUL;
-    SysTick->CTRL = 0;
-
-    /* Recreate the bootloader's initialised data. */
-    {
-        const volatile uint8_t *src = (const volatile uint8_t *)0x08002D68UL;
-        volatile uint8_t *dst = (volatile uint8_t *)0x20000000UL;
-        for (uint32_t i = 0; i < 0x34UL; i++) dst[i] = src[i];
-
-        src = (const volatile uint8_t *)0x08002D9CUL;
-        dst = (volatile uint8_t *)0x20000034UL;
-        for (uint32_t i = 0; i < 0x884UL; i++) dst[i] = src[i];
-    }
-
-    SCB->VTOR = BOOTLOADER_BASE;
-    __asm volatile ("msr msp, %0" : : "r" (*(volatile uint32_t *)BOOTLOADER_BASE));
-
-    /* Call as little of the bootloader as possible.
-     *
-     * The first attempt replicated its main() -- gpio_init, "lcd_init",
-     * uart_init -- and died partway: the screen went black (so bootloader code
-     * really did run) but the update loop never drew its UPDATE banner. One of
-     * those calls was also plain wrong: 0x080003F8 is lcd_gpio_init, not the
-     * ST7789 init at 0x08001588, which the doc's prose and its own function
-     * table disagree about.
-     *
-     * uart_update_mode() needs the UART, and the UART is already configured at
-     * 115200 by us. gpio_init and the LCD are irrelevant to a serial update.
-     * So call only uart_init -- to let the bootloader set the UART up its own
-     * way -- and then the update loop. Fewer calls, fewer guessed addresses,
-     * fewer ways to be wrong. */
-    ((void (*)(void))(0x0800214CUL | 1UL))();   /* uart_init */
-
-    __asm volatile ("cpsie i");
-
-    ((void (*)(void))(0x08000224UL | 1UL))();   /* uart_update_mode, no return */
-
-    for (;;)
-        ;
+    /* Straight into the RAM-resident updater. No bootloader, no side-button
+     * spoofing, no jumping into someone else's reset vector -- all of which
+     * were attempts to reach a bootloader that has no soft entry and that
+     * Radtel's own firmware never reaches either. */
+    updater_run();
 }
 
 void update_listener_feed(uint8_t c)
