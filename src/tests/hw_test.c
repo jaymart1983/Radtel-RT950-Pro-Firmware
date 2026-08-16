@@ -223,52 +223,58 @@ static void draw_hex(uint16_t y, const char *label, uint32_t v, uint16_t col)
 void test_blinky(void)
 {
     test_debug_init();
-    dbg_println("=== FLASH SIZE / ID TEST ===");
+    dbg_println("=== ADC SCAN + SI4732 RETRY ===");
 
-    /* Is this really a 2 MB W25Q16?
+    /* --- Which ADC channel is the battery? ------------------------------
+     * adc_read_battery() returned 4 and PA0 raw was 66 of 4095 -- about 53 mV,
+     * far too low for a battery sense line. The pinmap contradicts itself:
+     * one comment names PA1 as ADC2_CH1 battery voltage, another says
+     * ADC_Read_PA0 is the battery sense.
      *
-     * flash_layout.h says Winbond W25Q16, 2 MB. But the JEDEC ID reads
-     * 5E 40 16, and Winbond's manufacturer code is EF. The capacity byte is
-     * also wrong for that part: JEDEC encodes it as a power of two, so 0x15
-     * is 2 MB and 0x16 is 4 MB.
+     * Scanning every channel settles it. A 2S pack sits near 7-8.4 V, and any
+     * sane divider puts that in the upper half of the range -- so the battery
+     * channel should read well above 2000. Reading them all also maps out what
+     * else is wired to the ADC. */
+    for (uint8_t ch = 0; ch <= 9; ch++) {
+        uint16_t v = adc_read_channel(ch);
+        dbg_puts("ADC ch"); dbg_dec(ch);
+        dbg_puts(" = ");    dbg_dec(v);
+        dbg_puts("  (");    dbg_dec((uint32_t)v * 3300u / 4095u);
+        dbg_puts(" mV at pin)");
+        dbg_newline();
+        delay_ms(20);
+    }
+
+    /* --- SI4732: why no response? ---------------------------------------
+     * si4732_get_rev() returned an error and all-zero data. The part needs a
+     * reset pulse and a power-up command before it will answer anything, so
+     * "no response" may simply mean it was never brought out of reset --
+     * hw_init may not do it, or may do it in a different order.
      *
-     * A 2 MB chip ignores the top address bit, so address 0x200000 aliases
-     * back to 0x000000. A 4 MB chip does not. Writing nothing and simply
-     * comparing the two regions settles it non-destructively: channel 0 holds
-     * "GMRS 1", which is highly distinctive, so if 0x200000 returns the same
-     * bytes the part is 2 MB and wrapping. */
-    uint8_t lo[32], hi[32];
-    spi_flash_read(0x000000UL, lo, 32);
-    spi_flash_read(0x200000UL, hi, 32);
-
-    dbg_puts("JEDEC = "); dbg_hex8((uint8_t)(spi_flash_read_id() >> 16));
-    dbg_puts(" ");        dbg_hex8((uint8_t)(spi_flash_read_id() >> 8));
-    dbg_puts(" ");        dbg_hex8((uint8_t)spi_flash_read_id());
+     * Retry explicitly: reset, power up, then ask for the revision. Its
+     * response includes a fixed part number (0x32 for the Si4732), which is
+     * self-verifying -- if that byte comes back right, the chip is alive. */
+    dbg_println("SI4732: explicit reset + power up...");
+    si4732_init();
+    delay_ms(100);
+    int rc_pu = si4732_power_up_fm();
+    dbg_puts("  power_up rc="); dbg_dec((uint32_t)(rc_pu < 0 ? 255 : rc_pu));
     dbg_newline();
+    delay_ms(200);
 
-    dbg_puts("0x000000:");
-    for (uint8_t i = 0; i < 16; i++) { dbg_puts(" "); dbg_hex8(lo[i]); }
-    dbg_newline();
-    dbg_puts("0x200000:");
-    for (uint8_t i = 0; i < 16; i++) { dbg_puts(" "); dbg_hex8(hi[i]); }
-    dbg_newline();
+    {
+        uint8_t rev[16] = {0};
+        int rc = si4732_get_rev(rev);
+        dbg_puts("  get_rev rc="); dbg_dec((uint32_t)(rc < 0 ? 255 : rc));
+        dbg_puts(" data:");
+        for (uint8_t i = 0; i < 9; i++) { dbg_puts(" "); dbg_hex8(rev[i]); }
+        dbg_puts("   (want part number 0x32)");
+        dbg_newline();
+    }
 
-    uint8_t same = 1;
-    for (uint8_t i = 0; i < 32; i++)
-        if (lo[i] != hi[i]) { same = 0; break; }
-
-    dbg_println(same ? "SAME -> 2 MB part, address wraps"
-                     : "DIFFERENT -> larger than 2 MB");
-
-    /* Probe further out too, in case it is larger still. */
-    uint8_t q[16];
-    spi_flash_read(0x300000UL, q, 16);
-    dbg_puts("0x300000:");
-    for (uint8_t i = 0; i < 16; i++) { dbg_puts(" "); dbg_hex8(q[i]); }
-    dbg_newline();
-
+    dbg_println("=== SCAN COMPLETE ===");
     uint32_t hb = 0;
-    while (1) { dbg_puts("hb "); dbg_dec(hb++); dbg_newline(); delay_ms(2000); }
+    while (1) { dbg_puts("hb "); dbg_dec(hb++); dbg_newline(); delay_ms(3000); }
 }
 
 /* ==========================================================================

@@ -124,14 +124,38 @@ uint16_t adc_read_channel(uint8_t channel)
 
 uint8_t adc_read_battery(void)
 {
-    return (uint8_t)(adc_read_channel(0) >> 4);
+    /* Channel 1 (PA1), not channel 0.
+     *
+     * Measured by scanning every ADC channel on a running radio with a charged
+     * pack fitted:
+     *
+     *   ch0 =   69   (55 mV)    <- what this used to read
+     *   ch1 = 2461 (1983 mV)    <- battery, via its divider
+     *   ch2 = 1233  (993 mV)
+     *   ch4 = 2019 (1627 mV)
+     *   rest ~0
+     *
+     * 1983 mV through a roughly 4:1 divider is about 7.9 V, which is right for
+     * a charged 2S Li-ion pack. 55 mV is not a battery by any scaling.
+     *
+     * The pinmap contradicts itself here -- one comment names PA1 as
+     * "ADC2_CH1 (battery voltage)", another says ADC_Read_PA0 is the battery
+     * sense. The measurement agrees with the first.
+     *
+     * NOTE: the >> 4 scaling is inherited and NOT calibrated against a known
+     * pack voltage. It gives a stable relative reading; converting it to volts
+     * needs a real measurement against a meter. */
+    return (uint8_t)(adc_read_channel(1) >> 4);
 }
 
 /* ========================================================================
- *  adc_read_audio_level - Read audio level on PA1 (channel 1).
+ *  adc_read_audio_level - audio level.
  *
- *  OEM ADC_Read_PA1 @ fw 0x08013820 returns 8-bit (UBFX bits[11:4]).
- *  ubfx r0, r0, 4, 8 = (result >> 4) & 0xFF
+ *  WARNING: this reads channel 1, which the measurement above shows is the
+ *  BATTERY, not an audio level. Both functions were reading each other's
+ *  channels. Channel 4 (1627 mV) is the more likely audio candidate but has
+ *  not been confirmed, so this is left as-is and flagged rather than moved on
+ *  a guess -- changing it blind would trade one wrong answer for another.
  * ======================================================================== */
 
 uint8_t adc_read_audio_level(void)
