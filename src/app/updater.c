@@ -82,6 +82,23 @@ static uint8_t  pkt[BLOCK_SIZE + 16];
 static uint8_t  expkey[EXPKEY_LEN];
 static uint8_t  have_key;
 
+/* The entire image is buffered here before ANY flash operation.
+ *
+ * The first design interleaved receive with erase/program and failed
+ * reproducibly at block 8: a sector erase takes tens of milliseconds, the
+ * updater runs with interrupts off and polls the UART, and the receive
+ * register holds exactly one byte -- so everything arriving during an erase is
+ * lost. It also explains the earlier corruption, where the host saw success
+ * because every halfword we did write verified; the bytes we missed were never
+ * written at all.
+ *
+ * Buffering first means the flash pass runs with no UART traffic in flight and
+ * no timing relationship between the two. 56 KB is comfortably more than the
+ * full firmware (~48 KB) and leaves ample stack in the 96 KB of SRAM. */
+#define IMG_MAX  (56u * 1024u)
+static uint8_t  img[IMG_MAX];
+static uint32_t img_blocks;
+
 /* --- RAM-resident primitives ----------------------------------------- */
 
 RAMFUNC static void ram_putc(uint8_t c)
@@ -215,6 +232,7 @@ RAMFUNC void updater_run(void)
     __asm volatile ("cpsid i");                   /* no ISRs: they live in flash */
 
     have_key = 0;
+    img_blocks = 0;
     UART4->CR1 = (1UL << 13) | (1UL << 3) | (1UL << 2);   /* UE | TE | RE, no IRQ */
 
     for (;;) {
@@ -267,32 +285,41 @@ RAMFUNC void updater_run(void)
         case CMD_DATA: {
             uint8_t *d = &pkt[5];
 
+            /* Buffer only. No flash access here -- see the note on img[]. */
             if (args == 1u) {
-                /* The key block. Never written to flash -- it is not part of
-                 * the image, and the address map has no room for it. */
-                ram_expand_key(d);
+                ram_expand_key(d);                /* key block, never flashed */
                 ram_reply(cmd, RESULT_ACK);
                 break;
             }
 
-            uint32_t dest;
+            uint32_t off;
             if (args == 0u) {
-                dest = APP_BASE;                  /* block 0 is plaintext */
+                off = 0u;                         /* block 0, plaintext */
             } else {
                 if (!have_key) { ram_reply(cmd, RESULT_FLASH_ERR); break; }
                 ram_decrypt(d, dlen, (uint32_t)args * BLOCK_SIZE);
-                dest = APP_BASE + ((uint32_t)args - 1u) * BLOCK_SIZE;
+                off = ((uint32_t)args - 1u) * BLOCK_SIZE;
             }
 
-            ram_reply(cmd, ram_flash_write(dest, d, dlen) == 0
-                           ? RESULT_ACK : RESULT_FLASH_ERR);
+            if (off + dlen > IMG_MAX) { ram_reply(cmd, RESULT_LEN_ERR); break; }
+            for (uint16_t i = 0; i < dlen; i++)
+                img[off + i] = d[i];
+            if (off + dlen > img_blocks)
+                img_blocks = off + dlen;
+
+            ram_reply(cmd, RESULT_ACK);
             break;
         }
 
         case CMD_END:
+            /* Everything is in RAM now; write it in one pass. ACK first, so
+             * the host is not left waiting through the erase, and it has
+             * nothing further to send. */
             ram_reply(cmd, RESULT_ACK);
             for (volatile uint32_t i = 0; i < 200000UL; i++)
-                ;                                 /* let the reply drain */
+                ;
+            if (img_blocks)
+                (void)ram_flash_write(APP_BASE, img, (img_blocks + 1u) & ~1u);
             goto done;
 
         default:

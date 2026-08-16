@@ -166,63 +166,79 @@ static void dbg_dec(uint32_t v)
 
 void test_blinky(void)
 {
-    /* MINIMAL by design.
-     *
-     * No LCD, no fonts, no colour swatches. The only thing that matters right
-     * now is the ability to reflash a booted radio, and every extra kilobyte
-     * is more image to get corrupted and more variables in the way. Fonts and
-     * geometry can wait until flashing is reliable -- with soft push working,
-     * testing anything else becomes seconds instead of two battery pulls. */
     test_debug_init();
 
-    /* Visible state, no fonts.
-     *
-     * Solid colour blocks only: the font table is exactly the sort of late
-     * .rodata that has been landing wrong, so a text-based indicator could
-     * fail for reasons unrelated to what it is reporting. A screen filled with
-     * a flat colour cannot be misread.
-     *
-     *   BLUE   running, waiting for a handshake
-     *   GREEN  handshake seen -- the listener is matching
-     *   RED    handing over to the bootloader
-     */
     gpio_config_pin(LCD_BL_PORT, LCD_BL_PIN, GPIO_MODE_OUT_2MHZ, GPIO_CNF_PP);
     gpio_set_pin(LCD_BL_PORT, LCD_BL_PIN);
     lcd_init();
-    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0xFFE0);   /* YELLOW = v2 */
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x0000);
 
-    dbg_println("MIN v2: ZERO-TOUCH UPDATE PROOF");
+    /* FONT TEST
+     *
+     * Text rendered as garbage glyphs ("Chinese-looking") for most of this
+     * project. The cause was almost certainly the tail-of-image corruption:
+     * the bootloader drops the last block of an upload, and the 8x8 font table
+     * is late .rodata, so its glyph bitmaps were simply never written. Now that
+     * uploads pad with a sacrificial block, this should render cleanly.
+     *
+     * Every printable character is drawn, so a partially-bad table shows up as
+     * specific broken glyphs rather than a vague impression of wrongness. */
+    lcd_draw_string(4, 4,  "FONT TEST v3 - AUTOFLASH", 0xFFFF, 0x0000);
+    lcd_draw_string(4, 16, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0x07E0, 0x0000);
+    lcd_draw_string(4, 28, "abcdefghijklmnopqrstuvwxyz", 0x07E0, 0x0000);
+    lcd_draw_string(4, 40, "0123456789", 0xFFE0, 0x0000);
+    lcd_draw_string(4, 52, "!\"#$%&'()*+,-./:;<=>?@", 0x07FF, 0x0000);
+    lcd_draw_string(4, 64, "[\\]^_`{|}~", 0x07FF, 0x0000);
 
-    /* Does HANDSHAKE[] read correctly? This is the whole question: the matcher
-     * compares against this array, and it has been reading as garbage because
-     * it sits in the part of the image that never lands. */
-    dbg_puts("HS:");
-    for (uint8_t i = 0; i < update_listener_hs_len(); i++) {
-        dbg_puts(" ");
-        dbg_dec(update_listener_hs_byte(i));
+    lcd_draw_string(4, 84, "Channel 462.5625 MHz", 0xFFFF, 0x0000);
+    lcd_draw_string(4, 96, "GMRS 1   CTCSS 141.3", 0xFFFF, 0x0000);
+    lcd_draw_string(4,108, "Zone: Idaho Repeaters", 0xF81F, 0x0000);
+
+    /* Double-size, to check the 2x path too. */
+    lcd_draw_string_2x(4, 128, "BIG TEXT 123", 0xFFFF, 0x0000);
+
+    dbg_println("FONT TEST: full ASCII drawn");
+
+    /* Per-1KB flash checksums, so an image written by our own updater can be
+     * diffed against the same image written by the bootloader. The updater
+     * reports success and every halfword verifies, yet the result has a broken
+     * UART RX path -- so something is landing in the wrong PLACE rather than
+     * being written incorrectly. This says which kilobyte. */
+    {
+        const volatile uint8_t *fw = (const volatile uint8_t *)0x08003000UL;
+        for (uint8_t blk = 0; blk < 14; blk++) {
+            uint32_t sum = 0;
+            for (uint32_t i = 0; i < 1024; i++)
+                sum += fw[blk * 1024u + i];
+            dbg_puts("BLK ");
+            dbg_dec(blk);
+            dbg_puts("=");
+            dbg_dec(sum);
+            dbg_newline();
+        }
     }
-    dbg_newline();
-    dbg_println("ok: 80 82 79 71 82 65 77 66 84 57 48 48 48 85");
 
     uint32_t count = 0;
-    uint8_t  was_matching = 0;
     while (1) {
-        /* Turn green the moment the matcher starts advancing, so progress is
-         * visible on the radio without needing the cable. */
-        uint8_t m = update_listener_matched();
-        if (m && !was_matching) {
-            lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, 0x07E0);   /* green */
-            was_matching = 1;
-        }
+        /* Redraw one line continuously -- this is also the LCD redraw
+         * regression check: the static text above must stay legible. */
+        char buf[24]; uint8_t n = 0;
+        const char *l = "redraw ";
+        while (*l) buf[n++] = *l++;
+        uint32_t v = count; char t[12]; int ti = 0;
+        if (!v) t[ti++] = '0';
+        while (v) { t[ti++] = (char)('0' + (v % 10)); v /= 10; }
+        while (ti) buf[n++] = t[--ti];
+        buf[n++] = ' '; buf[n] = '\0';
+        lcd_draw_string(4, (uint16_t)(LCD_HEIGHT - 20), buf, 0x07E0, 0x0000);
 
-        dbg_puts("alive ");
-        dbg_dec(count++);
-        dbg_puts(" rx=");
-        dbg_dec(update_listener_rx_count());
-        dbg_puts(" match=");
-        dbg_dec(m);
-        dbg_newline();
-        delay_ms(1000);
+        if ((count % 5u) == 0u) {
+            dbg_puts("redraw ");
+            dbg_dec(count);
+            dbg_newline();
+        }
+        count++;
+        delay_ms(500);
     }
 }
 
